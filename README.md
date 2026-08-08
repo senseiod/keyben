@@ -159,6 +159,19 @@ export KEYBEN_SERVER="https://secrets.example.com"
 export KEYBEN_TOKEN="replace-with-the-server-auth-token"
 ```
 
+For a project-local setup, create an encrypted `.keyben.toml` file:
+
+```bash
+keyben config init \
+  --projectName frontierkings \
+  --server http://example.com \
+  --token 123456
+```
+
+Any omitted value is requested interactively. The command then asks for a configuration password (with confirmation) and encrypts the server URL and token before writing the file. The project name remains in plaintext so it can be used as the default project identifier.
+
+When a client command runs in the directory containing `.keyben.toml`, keyben asks for the configuration password and loads the encrypted server URL and token automatically. Explicit command-line values take precedence, followed by `KEYBEN_SERVER`/`KEYBEN_TOKEN`, and then the project-local file. Use `--config-password` or `KEYBEN_CONFIG_PASSWORD` for non-interactive use. The file is ordinary project data and is not assigned special filesystem permissions by keyben; do not commit it unless that is intentional.
+
 Each project has one password. During `init`, keyben asks for the password twice and stores only a project-bound SHA-256 verification hash on the server. The password itself is never sent to or stored by the server. If `--password` or `KEYBEN_PASSWORD` is not provided for `secrets` or `run`, keyben prompts for it interactively without echoing it:
 
 ```bash

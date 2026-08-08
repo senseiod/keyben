@@ -7,7 +7,8 @@ use serde_json::json;
 use std::{collections::BTreeMap, process::Command as ProcessCommand, time::Duration};
 
 use crate::{
-    cli::{Cli, Command, Env, PasswordCommand, SecretsCommand},
+    cli::{Cli, Command, ConfigCommand, Env, PasswordCommand, SecretsCommand},
+    config::{self, Config},
     crypto,
 };
 
@@ -36,10 +37,17 @@ pub async fn run(cli: Cli) -> Result<()> {
         .command
         .as_ref()
         .expect("the caller verified that a subcommand exists");
-    let api = Api::new(cli.server.as_deref(), cli.token.as_deref(), cli.insecure)?;
+    if let Command::Config { action } = command {
+        return run_config_command(action, &cli).await;
+    }
+
+    let project_arg = project_name_arg(command);
+    let runtime = resolve_runtime(&cli, project_arg)?;
+    let api = Api::new(Some(&runtime.server), Some(&runtime.token), cli.insecure)?;
 
     match command {
         Command::Init { project_name } => {
+            let project_name = project_name.as_deref().unwrap_or(&runtime.project_name);
             let password = resolve_new_password(
                 cli.password.as_ref(),
                 "Enter the new project password",
@@ -60,6 +68,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 let name = resolve_secret_name(name)?;
                 let value = resolve_secret_value(value)?;
                 let blob = crypto::encrypt(&password, &value)?;
+                let project_name = project_name.as_deref().unwrap_or(&runtime.project_name);
                 api.set_secret(project_name, *env, &name, &blob, &password)
                     .await?;
                 println!("Set {name} in {project_name}/{}", env.as_str());
@@ -71,6 +80,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 name: Some(name),
             } => {
                 let password = resolve_password(&cli.password)?;
+                let project_name = project_name.as_deref().unwrap_or(&runtime.project_name);
                 let blob = api.get_secret(project_name, *env, name, &password).await?;
                 println!("{}", crypto::decrypt(&password, &blob)?);
             }
@@ -81,6 +91,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 name: None,
             } => {
                 let password = resolve_password(&cli.password)?;
+                let project_name = project_name.as_deref().unwrap_or(&runtime.project_name);
                 for (name, value) in api.fetch_all(project_name, *env, &password).await? {
                     println!("{name}={value}");
                 }
@@ -92,6 +103,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 name,
             } => {
                 let password = resolve_password(&cli.password)?;
+                let project_name = project_name.as_deref().unwrap_or(&runtime.project_name);
                 api.delete_secret(project_name, *env, name, &password)
                     .await?;
                 println!("Deleted {name} from {project_name}/{}", env.as_str());
@@ -103,6 +115,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 project_name,
                 new_password,
             } => {
+                let project_name = project_name.as_deref().unwrap_or(&runtime.project_name);
                 reset_project_password(&api, project_name, &cli.password, new_password.as_ref())
                     .await?;
                 println!("Reset password for project `{project_name}`");
@@ -115,12 +128,134 @@ pub async fn run(cli: Cli) -> Result<()> {
             argv,
         } => {
             let password = resolve_password(&cli.password)?;
+            let project_name = project_name.as_deref().unwrap_or(&runtime.project_name);
             let secrets = api.fetch_all(project_name, *env, &password).await?;
             exec(argv, secrets)?;
+        }
+        Command::Config { .. } => {
+            unreachable!("config commands are handled before runtime resolution")
         }
     }
 
     Ok(())
+}
+
+struct RuntimeConfig {
+    project_name: String,
+    server: String,
+    token: String,
+}
+
+fn project_name_arg(command: &Command) -> Option<&str> {
+    match command {
+        Command::Init { project_name } | Command::Run { project_name, .. } => {
+            project_name.as_deref()
+        }
+        Command::Secrets { action } => match action {
+            SecretsCommand::Set { project_name, .. }
+            | SecretsCommand::Get { project_name, .. }
+            | SecretsCommand::Delete { project_name, .. } => project_name.as_deref(),
+        },
+        Command::Password { action } => match action {
+            PasswordCommand::Reset { project_name, .. } => project_name.as_deref(),
+        },
+        Command::Config { .. } => None,
+    }
+}
+
+fn resolve_runtime(cli: &Cli, project_arg: Option<&str>) -> Result<RuntimeConfig> {
+    let needs_file = cli.server.is_none() || cli.token.is_none() || project_arg.is_none();
+    let file_config = if needs_file && config::exists()? {
+        let password = resolve_config_password(&cli.config_password)?;
+        Some(config::read(&password)?)
+    } else {
+        None
+    };
+
+    let project_name = project_arg
+        .map(str::to_owned)
+        .or_else(|| file_config.as_ref().map(|c| c.project_name.clone()))
+        .unwrap_or_default();
+    let server = cli
+        .server
+        .clone()
+        .or_else(|| file_config.as_ref().map(|c| c.server.clone()));
+    let token = cli
+        .token
+        .clone()
+        .or_else(|| file_config.as_ref().map(|c| c.token.clone()));
+    let server = server
+        .filter(|s| !s.trim().is_empty())
+        .context("Missing server URL; use --server, KEYBEN_SERVER, or create .keyben.toml")?;
+    let token = token.filter(|s| !s.trim().is_empty()).context(
+        "Missing authentication token; use --token, KEYBEN_TOKEN, or create .keyben.toml",
+    )?;
+    let project_name = if project_name.trim().is_empty() {
+        bail!("Missing project name; use --projectName or create .keyben.toml")
+    } else {
+        project_name
+    };
+    config::validate_values(&project_name, &server, &token)?;
+    Ok(RuntimeConfig {
+        project_name,
+        server,
+        token,
+    })
+}
+
+async fn run_config_command(action: &ConfigCommand, cli: &Cli) -> Result<()> {
+    match action {
+        ConfigCommand::Init { project_name } => {
+            let project_name = project_name
+                .clone()
+                .or_else(|| prompt_text("Enter the project name"))
+                .context("Missing project name; use --projectName")?;
+            let server = cli
+                .server
+                .clone()
+                .or_else(|| prompt_text("Enter the server URL"))
+                .context("Missing server URL; use --server")?;
+            let token = cli
+                .token
+                .clone()
+                .or_else(|| prompt_text("Enter the authentication token"))
+                .context("Missing authentication token; use --token")?;
+            config::validate_values(&project_name, &server, &token)?;
+            let password = resolve_new_password(
+                cli.config_password.as_ref(),
+                "Enter the configuration password",
+                "use --config-password or KEYBEN_CONFIG_PASSWORD",
+            )?;
+            let file = config::write(
+                &Config {
+                    project_name,
+                    server,
+                    token,
+                },
+                &password,
+            )?;
+            println!("Wrote {}", file.display());
+        }
+    }
+    Ok(())
+}
+
+fn resolve_config_password(from_args: &Option<String>) -> Result<String> {
+    if let Some(value) = from_args {
+        if value.is_empty() {
+            bail!("Configuration password cannot be empty");
+        }
+        return Ok(value.clone());
+    }
+    dialoguer::Password::new().with_prompt("Enter the configuration password").interact()
+        .context("Failed to read configuration password (use --config-password or KEYBEN_CONFIG_PASSWORD)")
+}
+
+fn prompt_text(prompt: &str) -> Option<String> {
+    dialoguer::Input::<String>::new()
+        .with_prompt(prompt)
+        .interact_text()
+        .ok()
 }
 
 /// Resolve the password from an argument or environment variable, otherwise prompt securely.

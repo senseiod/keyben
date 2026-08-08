@@ -43,6 +43,15 @@ pub struct Cli {
     )]
     pub token: Option<String>,
 
+    /// Password used to decrypt `.keyben.toml`; prompts securely when needed.
+    #[arg(
+        long = "config-password",
+        env = "KEYBEN_CONFIG_PASSWORD",
+        value_name = "PASSWORD",
+        hide_env_values = true
+    )]
+    pub config_password: Option<String>,
+
     /// Project password; prompts securely when omitted.
     #[arg(
         long,
@@ -76,7 +85,13 @@ pub enum Command {
     Init {
         /// Project name.
         #[arg(long = "projectName", value_name = "NAME")]
-        project_name: String,
+        project_name: Option<String>,
+    },
+
+    /// Manage the project-local client configuration.
+    Config {
+        #[command(subcommand)]
+        action: ConfigCommand,
     },
 
     /// Manage a project's environment variables.
@@ -95,7 +110,7 @@ pub enum Command {
     Run {
         /// Project name.
         #[arg(long = "projectName", value_name = "NAME")]
-        project_name: String,
+        project_name: Option<String>,
 
         /// Environment.
         #[arg(long, value_enum)]
@@ -118,7 +133,7 @@ pub enum SecretsCommand {
     Set {
         /// Project name.
         #[arg(long = "projectName", value_name = "NAME")]
-        project_name: String,
+        project_name: Option<String>,
 
         /// Environment.
         #[arg(long, value_enum)]
@@ -137,7 +152,7 @@ pub enum SecretsCommand {
     Get {
         /// Project name.
         #[arg(long = "projectName", value_name = "NAME")]
-        project_name: String,
+        project_name: Option<String>,
 
         /// Environment.
         #[arg(long, value_enum)]
@@ -152,7 +167,7 @@ pub enum SecretsCommand {
     Delete {
         /// Project name.
         #[arg(long = "projectName", value_name = "NAME")]
-        project_name: String,
+        project_name: Option<String>,
 
         /// Environment.
         #[arg(long, value_enum)]
@@ -165,12 +180,22 @@ pub enum SecretsCommand {
 }
 
 #[derive(Debug, Subcommand)]
+pub enum ConfigCommand {
+    /// Create or replace the project-local .keyben.toml file.
+    Init {
+        /// Project name; prompts interactively when omitted.
+        #[arg(long = "projectName", value_name = "NAME")]
+        project_name: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 pub enum PasswordCommand {
     /// Re-encrypt every secret and replace the project's password.
     Reset {
         /// Project name.
         #[arg(long = "projectName", value_name = "NAME")]
-        project_name: String,
+        project_name: Option<String>,
 
         /// New project password; prompts securely when omitted.
         #[arg(
@@ -251,7 +276,7 @@ mod tests {
         else {
             panic!("expected password reset command");
         };
-        assert_eq!(project_name, "frontierkings");
+        assert_eq!(project_name.as_deref(), Some("frontierkings"));
         assert_eq!(new_password.as_deref(), Some("new-password"));
         assert_eq!(cli.password.as_deref(), Some("old-password"));
     }
@@ -277,5 +302,31 @@ mod tests {
         };
         assert_eq!(name, None);
         assert_eq!(value, None);
+    }
+
+    #[test]
+    fn parses_config_init_with_optional_values() {
+        let cli = Cli::try_parse_from([
+            "keyben",
+            "config",
+            "init",
+            "--projectName",
+            "frontierkings",
+            "--server",
+            "http://example.com",
+            "--token",
+            "123456",
+        ])
+        .unwrap();
+
+        assert_eq!(cli.server.as_deref(), Some("http://example.com"));
+        assert_eq!(cli.token.as_deref(), Some("123456"));
+        let Command::Config {
+            action: ConfigCommand::Init { project_name },
+        } = cli.command.unwrap()
+        else {
+            panic!("expected config init command");
+        };
+        assert_eq!(project_name.as_deref(), Some("frontierkings"));
     }
 }
