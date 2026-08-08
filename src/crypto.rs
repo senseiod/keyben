@@ -15,6 +15,16 @@ const NONCE_LEN: usize = 12;
 /// Poly1305 authentication tag length in bytes.
 const TAG_LEN: usize = 16;
 
+/// Derive the project-bound verification value sent to the server.
+pub fn project_password_hash(project: &str, password: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"keyben-project-password-v1\0");
+    hasher.update((project.len() as u64).to_be_bytes());
+    hasher.update(project.as_bytes());
+    hasher.update(password.as_bytes());
+    B64.encode(hasher.finalize())
+}
+
 /// Hash a password of any length into a 32-byte symmetric key with SHA-256.
 fn cipher_for(password: &str) -> ChaCha20Poly1305 {
     let key_bytes: [u8; 32] = Sha256::digest(password.as_bytes()).into();
@@ -84,6 +94,14 @@ mod tests {
     fn wrong_password_fails() {
         let blob = encrypt("right", "secret").unwrap();
         assert!(decrypt("wrong", &blob).is_err());
+    }
+
+    #[test]
+    fn project_password_hash_is_bound_to_project_and_password() {
+        let hash = project_password_hash("app", "right");
+        assert_eq!(hash, project_password_hash("app", "right"));
+        assert_ne!(hash, project_password_hash("other", "right"));
+        assert_ne!(hash, project_password_hash("app", "wrong"));
     }
 
     #[test]

@@ -2,12 +2,12 @@
 
 use anyhow::{Context, Result, bail};
 use reqwest::{RequestBuilder, Response, StatusCode};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{collections::BTreeMap, process::Command as ProcessCommand, time::Duration};
 
 use crate::{
-    cli::{Cli, Command, Env, SecretsCommand},
+    cli::{Cli, Command, Env, PasswordCommand, SecretsCommand},
     crypto,
 };
 
@@ -22,6 +22,14 @@ struct SecretEntry {
     value: String,
 }
 
+#[derive(Debug, Serialize)]
+struct PasswordResetSecret {
+    env: String,
+    name: String,
+    old_value: String,
+    new_value: String,
+}
+
 /// Execute a subcommand in client mode.
 pub async fn run(cli: Cli) -> Result<()> {
     let command = cli
@@ -32,7 +40,12 @@ pub async fn run(cli: Cli) -> Result<()> {
 
     match command {
         Command::Init { project_name } => {
-            api.create_project(project_name).await?;
+            let password = resolve_new_password(
+                cli.password.as_ref(),
+                "Enter the new project password",
+                "use --password or KEYBEN_PASSWORD in non-interactive environments",
+            )?;
+            api.create_project(project_name, &password).await?;
             println!("Project `{project_name}` created");
         }
 
@@ -45,7 +58,8 @@ pub async fn run(cli: Cli) -> Result<()> {
             } => {
                 let password = resolve_password(&cli.password)?;
                 let blob = crypto::encrypt(&password, value)?;
-                api.set_secret(project_name, *env, name, &blob).await?;
+                api.set_secret(project_name, *env, name, &blob, &password)
+                    .await?;
                 println!("Set {name} in {project_name}/{}", env.as_str());
             }
 
@@ -55,7 +69,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 name: Some(name),
             } => {
                 let password = resolve_password(&cli.password)?;
-                let blob = api.get_secret(project_name, *env, name).await?;
+                let blob = api.get_secret(project_name, *env, name, &password).await?;
                 println!("{}", crypto::decrypt(&password, &blob)?);
             }
 
@@ -75,8 +89,21 @@ pub async fn run(cli: Cli) -> Result<()> {
                 env,
                 name,
             } => {
-                api.delete_secret(project_name, *env, name).await?;
+                let password = resolve_password(&cli.password)?;
+                api.delete_secret(project_name, *env, name, &password)
+                    .await?;
                 println!("Deleted {name} from {project_name}/{}", env.as_str());
+            }
+        },
+
+        Command::Password { action } => match action {
+            PasswordCommand::Reset {
+                project_name,
+                new_password,
+            } => {
+                reset_project_password(&api, project_name, &cli.password, new_password.as_ref())
+                    .await?;
+                println!("Reset password for project `{project_name}`");
             }
         },
 
@@ -97,13 +124,74 @@ pub async fn run(cli: Cli) -> Result<()> {
 /// Resolve the password from an argument or environment variable, otherwise prompt securely.
 fn resolve_password(from_args: &Option<String>) -> Result<String> {
     if let Some(password) = from_args {
+        if password.is_empty() {
+            bail!("Project password cannot be empty");
+        }
         return Ok(password.clone());
     }
 
     dialoguer::Password::new()
-        .with_prompt("Enter the encryption/decryption password")
+        .with_prompt("Enter the project password")
         .interact()
         .context("Failed to read password (use --password or KEYBEN_PASSWORD in non-interactive environments)")
+}
+
+fn resolve_new_password(from_args: Option<&String>, prompt: &str, usage: &str) -> Result<String> {
+    if let Some(password) = from_args {
+        if password.is_empty() {
+            bail!("Project password cannot be empty");
+        }
+        return Ok(password.clone());
+    }
+
+    dialoguer::Password::new()
+        .with_prompt(prompt)
+        .with_confirmation(
+            "Confirm the new project password",
+            "Project passwords do not match",
+        )
+        .interact()
+        .with_context(|| format!("Failed to read project password ({usage})"))
+}
+
+async fn reset_project_password(
+    api: &Api,
+    project: &str,
+    old_password_args: &Option<String>,
+    new_password_args: Option<&String>,
+) -> Result<()> {
+    let old_password = resolve_password(old_password_args)?;
+    let new_password = resolve_new_password(
+        new_password_args,
+        "Enter the new project password",
+        "use --new-password or KEYBEN_NEW_PASSWORD in non-interactive environments",
+    )?;
+    if old_password == new_password {
+        bail!("New project password must differ from the current password");
+    }
+
+    let mut secrets = Vec::new();
+    for env in [Env::Dev, Env::Prod] {
+        for entry in api.fetch_encrypted(project, env, &old_password).await? {
+            let plaintext = crypto::decrypt(&old_password, &entry.value).with_context(|| {
+                format!(
+                    "Failed to decrypt variable `{}` in {}/{}",
+                    entry.name,
+                    project,
+                    env.as_str()
+                )
+            })?;
+            secrets.push(PasswordResetSecret {
+                env: env.as_str().to_owned(),
+                name: entry.name,
+                old_value: entry.value,
+                new_value: crypto::encrypt(&new_password, &plaintext)?,
+            });
+        }
+    }
+
+    api.reset_project_password(project, &old_password, &new_password, &secrets)
+        .await
 }
 
 /// Inject decrypted environment variables, launch the child process unchanged, and propagate its exit code.
@@ -208,24 +296,79 @@ impl Api {
         bail!("Server returned {status}: {detail}");
     }
 
-    async fn create_project(&self, project: &str) -> Result<()> {
+    async fn create_project(&self, project: &str, password: &str) -> Result<()> {
         let url = format!("{}/api/projects", self.base);
-        self.send(self.http.post(url).json(&json!({ "name": project })))
-            .await?;
+        self.send(self.http.post(url).json(&json!({
+            "name": project,
+            "password_hash": crypto::project_password_hash(project, password)
+        })))
+        .await?;
         Ok(())
     }
 
-    async fn set_secret(&self, project: &str, env: Env, name: &str, blob: &str) -> Result<()> {
+    async fn reset_project_password(
+        &self,
+        project: &str,
+        old_password: &str,
+        new_password: &str,
+        secrets: &[PasswordResetSecret],
+    ) -> Result<()> {
+        let url = format!(
+            "{}/api/project-passwords/{}",
+            self.base,
+            percent_encode(project)
+        );
+        self.send(
+            self.http
+                .post(url)
+                .header(
+                    PROJECT_PASSWORD_HEADER,
+                    crypto::project_password_hash(project, old_password),
+                )
+                .json(&json!({
+                    "password_hash": crypto::project_password_hash(project, new_password),
+                    "secrets": secrets,
+                })),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn set_secret(
+        &self,
+        project: &str,
+        env: Env,
+        name: &str,
+        blob: &str,
+        password: &str,
+    ) -> Result<()> {
         let url = self.url(&[project, env.as_str(), name]);
-        self.send(self.http.put(url).json(&json!({ "value": blob })))
-            .await?;
+        self.send(
+            self.http
+                .put(url)
+                .header(
+                    PROJECT_PASSWORD_HEADER,
+                    crypto::project_password_hash(project, password),
+                )
+                .json(&json!({ "value": blob })),
+        )
+        .await?;
         Ok(())
     }
 
-    async fn get_secret(&self, project: &str, env: Env, name: &str) -> Result<String> {
+    async fn get_secret(
+        &self,
+        project: &str,
+        env: Env,
+        name: &str,
+        password: &str,
+    ) -> Result<String> {
         let url = self.url(&[project, env.as_str(), name]);
         let payload: SecretValue = self
-            .send(self.http.get(url))
+            .send(self.http.get(url).header(
+                PROJECT_PASSWORD_HEADER,
+                crypto::project_password_hash(project, password),
+            ))
             .await?
             .json()
             .await
@@ -233,9 +376,19 @@ impl Api {
         Ok(payload.value)
     }
 
-    async fn delete_secret(&self, project: &str, env: Env, name: &str) -> Result<()> {
+    async fn delete_secret(
+        &self,
+        project: &str,
+        env: Env,
+        name: &str,
+        password: &str,
+    ) -> Result<()> {
         let url = self.url(&[project, env.as_str(), name]);
-        self.send(self.http.delete(url)).await?;
+        self.send(self.http.delete(url).header(
+            PROJECT_PASSWORD_HEADER,
+            crypto::project_password_hash(project, password),
+        ))
+        .await?;
         Ok(())
     }
 
@@ -246,13 +399,7 @@ impl Api {
         env: Env,
         password: &str,
     ) -> Result<BTreeMap<String, String>> {
-        let url = self.url(&[project, env.as_str()]);
-        let entries: Vec<SecretEntry> = self
-            .send(self.http.get(url))
-            .await?
-            .json()
-            .await
-            .context("Failed to parse server response")?;
+        let entries = self.fetch_encrypted(project, env, password).await?;
 
         entries
             .into_iter()
@@ -262,6 +409,23 @@ impl Api {
                 Ok((entry.name, value))
             })
             .collect()
+    }
+
+    async fn fetch_encrypted(
+        &self,
+        project: &str,
+        env: Env,
+        password: &str,
+    ) -> Result<Vec<SecretEntry>> {
+        let url = self.url(&[project, env.as_str()]);
+        self.send(self.http.get(url).header(
+            PROJECT_PASSWORD_HEADER,
+            crypto::project_password_hash(project, password),
+        ))
+        .await?
+        .json()
+        .await
+        .context("Failed to parse server response")
     }
 }
 
@@ -278,6 +442,8 @@ fn percent_encode(segment: &str) -> String {
     }
     encoded
 }
+
+const PROJECT_PASSWORD_HEADER: &str = "x-keyben-project-password";
 
 #[cfg(test)]
 mod tests {

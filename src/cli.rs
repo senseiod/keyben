@@ -2,7 +2,7 @@
 //!
 //! The binary has two operating modes:
 //! - provide `-c/--config` to run as the server (`keyben-server`);
-//! - provide a subcommand (`init` / `secrets` / `run`) to run as the client.
+//! - provide a subcommand (`init` / `secrets` / `password` / `run`) to run as the client.
 
 use clap::{ArgAction, Parser, Subcommand, ValueEnum, builder::BoolishValueParser};
 use std::path::PathBuf;
@@ -14,13 +14,14 @@ use std::path::PathBuf;
     about = "End-to-end encrypted environment variable manager (one binary for client and server)",
     long_about = "keyben — an end-to-end encrypted environment variable manager.\n\n\
                   Server mode: keyben -c /etc/keyben/config.toml\n\
-                  Client mode: keyben init | keyben secrets ... | keyben run ...\n\n\
+                  Client mode: keyben init | keyben secrets ... | keyben password ... | keyben run ...\n\n\
                   All encryption and decryption happen on the client (ChaCha20-Poly1305); the server stores only Base64 ciphertext.",
     after_help = "Examples:\n  \
         keyben -c config.toml\n  \
         keyben --server http://127.0.0.1:8000 init --projectName myapp\n  \
         keyben secrets set --projectName myapp --env dev --name DB_URL --value 'postgres://...'\n  \
         keyben secrets get --projectName myapp --env dev\n  \
+        keyben password reset --projectName myapp\n  \
         keyben run --projectName myapp --env prod -- ./server --port 8080"
 )]
 pub struct Cli {
@@ -42,7 +43,7 @@ pub struct Cli {
     )]
     pub token: Option<String>,
 
-    /// Encryption/decryption password; prompts securely when omitted.
+    /// Project password; prompts securely when omitted.
     #[arg(
         long,
         global = true,
@@ -82,6 +83,12 @@ pub enum Command {
     Secrets {
         #[command(subcommand)]
         action: SecretsCommand,
+    },
+
+    /// Manage a project's encryption password.
+    Password {
+        #[command(subcommand)]
+        action: PasswordCommand,
     },
 
     /// Inject decrypted environment variables and launch a child process.
@@ -157,6 +164,25 @@ pub enum SecretsCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+pub enum PasswordCommand {
+    /// Re-encrypt every secret and replace the project's password.
+    Reset {
+        /// Project name.
+        #[arg(long = "projectName", value_name = "NAME")]
+        project_name: String,
+
+        /// New project password; prompts securely when omitted.
+        #[arg(
+            long = "new-password",
+            env = "KEYBEN_NEW_PASSWORD",
+            value_name = "PASSWORD",
+            hide_env_values = true
+        )]
+        new_password: Option<String>,
+    },
+}
+
 /// Environment identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "lower")]
@@ -171,5 +197,62 @@ impl Env {
             Env::Dev => "dev",
             Env::Prod => "prod",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_global_password_after_nested_subcommand_arguments() {
+        let cli = Cli::try_parse_from([
+            "keyben",
+            "--server",
+            "http://127.0.0.1:4000",
+            "secrets",
+            "get",
+            "--env",
+            "dev",
+            "--projectName",
+            "frontierkings",
+            "--token",
+            "123456",
+            "--password",
+            "123",
+        ])
+        .unwrap();
+
+        assert_eq!(cli.password.as_deref(), Some("123"));
+    }
+
+    #[test]
+    fn parses_password_reset_arguments() {
+        let cli = Cli::try_parse_from([
+            "keyben",
+            "password",
+            "reset",
+            "--projectName",
+            "frontierkings",
+            "--new-password",
+            "new-password",
+            "--password",
+            "old-password",
+        ])
+        .unwrap();
+
+        let Command::Password {
+            action:
+                PasswordCommand::Reset {
+                    project_name,
+                    new_password,
+                },
+        } = cli.command.unwrap()
+        else {
+            panic!("expected password reset command");
+        };
+        assert_eq!(project_name, "frontierkings");
+        assert_eq!(new_password.as_deref(), Some("new-password"));
+        assert_eq!(cli.password.as_deref(), Some("old-password"));
     }
 }

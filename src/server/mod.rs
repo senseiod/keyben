@@ -4,11 +4,12 @@ use anyhow::{Context, Result};
 use axum::{
     Json, Router,
     extract::{Path as AxumPath, Request, State},
-    http::{StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use axum_server::{Handle, tls_rustls::RustlsConfig};
+use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{net::SocketAddr, path::Path, time::Duration};
@@ -18,7 +19,7 @@ use tower_http::{
 };
 
 use config::Config;
-use db::Db;
+use db::{Db, PasswordResetResult, PasswordResetSecret};
 
 mod config;
 mod db;
@@ -82,6 +83,10 @@ fn router(db: Db, auth_token: &str) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/api/projects", post(create_project))
+        .route(
+            "/api/project-passwords/{project}",
+            post(reset_project_password),
+        )
         .route("/api/projects/{project}/{env}", get(list_secrets))
         .route(
             "/api/projects/{project}/{env}/{name}",
@@ -156,7 +161,24 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 #[derive(Debug, Deserialize)]
 struct CreateProject {
     name: String,
+    password_hash: String,
 }
+
+#[derive(Debug, Deserialize)]
+struct ResetProjectPassword {
+    password_hash: String,
+    secrets: Vec<ResetProjectSecret>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResetProjectSecret {
+    env: String,
+    name: String,
+    old_value: String,
+    new_value: String,
+}
+
+const PROJECT_PASSWORD_HEADER: &str = "x-keyben-project-password";
 
 /// The value is always Base64 ciphertext encrypted by the client.
 #[derive(Debug, Deserialize, Serialize)]
@@ -180,32 +202,116 @@ async fn create_project(
     if name.is_empty() {
         return Err(ApiError::bad_request("Project name cannot be empty"));
     }
+    validate_password_hash(&body.password_hash)?;
 
-    db.create_project(name).await?;
-    Ok(StatusCode::CREATED)
+    if db.create_project(name, body.password_hash.trim()).await? {
+        Ok(StatusCode::CREATED)
+    } else {
+        Err(ApiError::conflict(format!(
+            "Project `{name}` already has a password"
+        )))
+    }
+}
+
+async fn reset_project_password(
+    State(db): State<Db>,
+    AxumPath(project): AxumPath<String>,
+    headers: HeaderMap,
+    Json(body): Json<ResetProjectPassword>,
+) -> Result<StatusCode, ApiError> {
+    if project.trim().is_empty() {
+        return Err(ApiError::bad_request("Project name cannot be empty"));
+    }
+    validate_password_hash(&body.password_hash)?;
+
+    let old_password_hash = authorize_project(&db, &project, &headers).await?;
+    if constant_time_eq(
+        old_password_hash.as_bytes(),
+        body.password_hash.trim().as_bytes(),
+    ) {
+        return Err(ApiError::bad_request(
+            "New project password must differ from the current password",
+        ));
+    }
+
+    let secrets = body
+        .secrets
+        .into_iter()
+        .map(|secret| {
+            validate_project_and_env(&project, &secret.env, Some(&secret.name))?;
+            Ok(PasswordResetSecret {
+                env: secret.env,
+                name: secret.name,
+                old_value: secret.old_value,
+                new_value: secret.new_value,
+            })
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
+
+    match db
+        .reset_password(
+            &project,
+            &old_password_hash,
+            body.password_hash.trim(),
+            &secrets,
+        )
+        .await?
+    {
+        PasswordResetResult::Updated => Ok(StatusCode::NO_CONTENT),
+        PasswordResetResult::PasswordMismatch => {
+            Err(ApiError::forbidden("Project password is incorrect"))
+        }
+        PasswordResetResult::SecretsChanged => Err(ApiError::conflict(
+            "Project secrets changed while resetting the password; please try again",
+        )),
+    }
+}
+
+fn validate_password_hash(password_hash: &str) -> Result<(), ApiError> {
+    if password_hash.trim().is_empty() {
+        return Err(ApiError::bad_request(
+            "Project password hash cannot be empty",
+        ));
+    }
+    let decoded = B64
+        .decode(password_hash.trim())
+        .map_err(|_| ApiError::bad_request("Project password hash must be valid Base64"))?;
+    if decoded.len() != 32 {
+        return Err(ApiError::bad_request(
+            "Project password hash must decode to 32 bytes",
+        ));
+    }
+    Ok(())
 }
 
 async fn set_secret(
     State(db): State<Db>,
     AxumPath((project, env, name)): AxumPath<(String, String, String)>,
+    headers: HeaderMap,
     Json(body): Json<SecretValue>,
 ) -> Result<StatusCode, ApiError> {
     validate_project_and_env(&project, &env, Some(&name))?;
-    if !db.project_exists(&project).await? {
-        return Err(ApiError::not_found(format!(
-            "Project `{project}` does not exist; run keyben init --projectName {project} first"
-        )));
-    }
+    let password_hash = authorize_project(&db, &project, &headers).await?;
 
-    db.set_secret(&project, &env, &name, &body.value).await?;
-    Ok(StatusCode::NO_CONTENT)
+    if db
+        .set_secret_if_password_matches(&project, &env, &name, &body.value, &password_hash)
+        .await?
+    {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::conflict(
+            "Project password changed while writing the secret; please try again",
+        ))
+    }
 }
 
 async fn get_secret(
     State(db): State<Db>,
     AxumPath((project, env, name)): AxumPath<(String, String, String)>,
+    headers: HeaderMap,
 ) -> Result<Json<SecretValue>, ApiError> {
     validate_project_and_env(&project, &env, Some(&name))?;
+    let _password_hash = authorize_project(&db, &project, &headers).await?;
     match db.get_secret(&project, &env, &name).await? {
         Some(value) => Ok(Json(SecretValue { value })),
         None => Err(ApiError::not_found(format!(
@@ -217,13 +323,10 @@ async fn get_secret(
 async fn list_secrets(
     State(db): State<Db>,
     AxumPath((project, env)): AxumPath<(String, String)>,
+    headers: HeaderMap,
 ) -> Result<Json<Vec<SecretEntry>>, ApiError> {
     validate_project_and_env(&project, &env, None)?;
-    if !db.project_exists(&project).await? {
-        return Err(ApiError::not_found(format!(
-            "Project `{project}` does not exist"
-        )));
-    }
+    let _password_hash = authorize_project(&db, &project, &headers).await?;
 
     let secrets = db
         .list_secrets(&project, &env)
@@ -238,14 +341,40 @@ async fn list_secrets(
 async fn delete_secret(
     State(db): State<Db>,
     AxumPath((project, env, name)): AxumPath<(String, String, String)>,
+    headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
     validate_project_and_env(&project, &env, Some(&name))?;
-    if db.delete_secret(&project, &env, &name).await? {
+    let password_hash = authorize_project(&db, &project, &headers).await?;
+    if db
+        .delete_secret_if_password_matches(&project, &env, &name, &password_hash)
+        .await?
+    {
         Ok(StatusCode::NO_CONTENT)
     } else {
+        authorize_project(&db, &project, &headers).await?;
         Err(ApiError::not_found(format!(
             "Secret `{name}` does not exist in {project}/{env}"
         )))
+    }
+}
+
+async fn authorize_project(
+    db: &Db,
+    project: &str,
+    headers: &HeaderMap,
+) -> Result<String, ApiError> {
+    let expected = db
+        .project_password_hash(project)
+        .await?
+        .ok_or_else(|| ApiError::not_found(format!("Project `{project}` does not exist")))?;
+    let provided = headers
+        .get(PROJECT_PASSWORD_HEADER)
+        .map(|value| value.as_bytes())
+        .unwrap_or_default();
+    if constant_time_eq(provided, expected.as_bytes()) {
+        Ok(expected)
+    } else {
+        Err(ApiError::forbidden("Project password is incorrect"))
     }
 }
 
@@ -267,6 +396,7 @@ fn validate_project_and_env(project: &str, env: &str, name: Option<&str>) -> Res
 // --------------------------------------------------------------------- Errors
 
 /// Consistent JSON error response: `{"error": "..."}`.
+#[derive(Debug)]
 struct ApiError {
     status: StatusCode,
     message: String,
@@ -286,6 +416,20 @@ impl ApiError {
             message: message.into(),
         }
     }
+
+    fn forbidden(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            message: message.into(),
+        }
+    }
+
+    fn conflict(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            message: message.into(),
+        }
+    }
 }
 
 impl From<sqlx::Error> for ApiError {
@@ -301,5 +445,46 @@ impl From<sqlx::Error> for ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         (self.status, Json(json!({ "error": self.message }))).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn project_password_is_checked_before_secret_access() {
+        let path =
+            std::env::temp_dir().join(format!("keyben-server-test-{}.db", rand::random::<u64>()));
+        let db = Db::open(&path).await.unwrap();
+        db.create_project("app", "correct-hash").await.unwrap();
+        db.set_secret("app", "dev", "TOKEN", "ciphertext")
+            .await
+            .unwrap();
+
+        let mut wrong_headers = HeaderMap::new();
+        wrong_headers.insert(PROJECT_PASSWORD_HEADER, "wrong-hash".parse().unwrap());
+        let error = get_secret(
+            State(db.clone()),
+            AxumPath(("app".to_owned(), "dev".to_owned(), "TOKEN".to_owned())),
+            wrong_headers,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
+
+        let mut correct_headers = HeaderMap::new();
+        correct_headers.insert(PROJECT_PASSWORD_HEADER, "correct-hash".parse().unwrap());
+        let Json(secret) = get_secret(
+            State(db.clone()),
+            AxumPath(("app".to_owned(), "dev".to_owned(), "TOKEN".to_owned())),
+            correct_headers,
+        )
+        .await
+        .unwrap();
+        assert_eq!(secret.value, "ciphertext");
+
+        drop(db);
+        std::fs::remove_file(path).unwrap();
     }
 }

@@ -2,13 +2,13 @@
 
 keyben is a self-hosted environment-variable and secret management tool written in Rust. It is distributed as a single binary that can run either as a storage server or as a command-line client.
 
-The client encrypts every secret before sending it to the server. The server stores and returns Base64-encoded ciphertext, but never receives the encryption password or plaintext value.
+The client encrypts every secret before sending it to the server. The server stores and returns Base64-encoded ciphertext plus a project-bound password verification hash, but never receives the encryption password or plaintext value.
 
 ## Highlights
 
 - End-to-end encryption on the client using ChaCha20-Poly1305.
 - A SHA-256-derived 32-byte key and a fresh random nonce for every value.
-- SQLite-backed server with a small HTTP API.
+- SQLite-backed server with a small HTTP API and project password verification.
 - Bearer Token authentication on every endpoint, including `/healthz`.
 - Optional TLS with a PEM certificate and private key.
 - `keyben run` injects decrypted values into a child process without writing a `.env` file.
@@ -35,15 +35,15 @@ The server is intentionally unable to decrypt values. Anyone who needs to read a
 ## Advantages
 
 - **Simple deployment:** one executable and one TOML file; no separate database service is required.
-- **Encrypted server storage:** the SQLite database contains ciphertext rather than plaintext credentials.
+- **Encrypted server storage:** the SQLite database contains ciphertext and password verification hashes rather than plaintext credentials.
 - **Small attack surface:** the server exposes only project and secret CRUD endpoints and does not implement user accounts or a browser UI.
 - **Safe process injection:** `run` passes values directly to the child process instead of creating a plaintext configuration file.
 - **Portable:** official release archives cover common Linux, musl, macOS ARM64, and Windows targets.
 
 ## Limitations and trade-offs
 
-- **The password KDF is intentionally small and simple:** the current implementation hashes the password once with SHA-256. It does not use a slow password-hashing function such as Argon2 or scrypt, so weak passwords are vulnerable to offline brute-force attacks if ciphertext is obtained. Use a long, randomly generated password.
-- **Bearer Token authentication is not an identity system:** there are no users, roles, per-project permissions, token rotation, or audit logs. Anyone with the token can access every project on the server.
+- **The password KDF is intentionally small and simple:** the current implementation hashes the password once with SHA-256. It does not use a slow password-hashing function such as Argon2 or scrypt, so weak passwords are vulnerable to offline brute-force attacks if the database, ciphertext, or project verification hash is obtained. Use a long, randomly generated password.
+- **Bearer Token authentication is not an identity system:** there are no users, roles, token rotation, or audit logs. Access to project secrets additionally requires that project's password verification value.
 - **The server is not trusted for availability or integrity:** it can delete, replace, or withhold ciphertext even though it cannot decrypt it. Use backups and monitoring for important deployments.
 - **TLS is optional:** without `cert` and `key`, the server uses plaintext HTTP. Only expose that mode on a trusted private network such as Tailscale, or configure TLS.
 - **Command-line values can leak:** values passed through `--value`, `--password`, or environment variables may be visible in shell history, process listings, CI logs, or crash reports. Prefer the interactive password prompt and a protected automation secret store.
@@ -159,7 +159,7 @@ export KEYBEN_SERVER="https://secrets.example.com"
 export KEYBEN_TOKEN="replace-with-the-server-auth-token"
 ```
 
-The encryption password is deliberately not stored in the config file. If `--password` or `KEYBEN_PASSWORD` is not provided, keyben prompts for it interactively without echoing it:
+Each project has one password. During `init`, keyben asks for the password twice and stores only a project-bound SHA-256 verification hash on the server. The password itself is never sent to or stored by the server. If `--password` or `KEYBEN_PASSWORD` is not provided for `secrets` or `run`, keyben prompts for it interactively without echoing it:
 
 ```bash
 keyben secrets get --projectName myapp --env prod --name DB_URL
@@ -177,7 +177,18 @@ All commands below assume `KEYBEN_SERVER` and `KEYBEN_TOKEN` are set. A project 
 keyben init --projectName myapp
 ```
 
-Project creation is idempotent; running it again does not remove existing secrets.
+Project creation is idempotent when the same password is supplied again; a different password is rejected. Running it again does not remove existing secrets.
+
+### Reset a project password
+
+```bash
+keyben password reset \
+  --projectName myapp \
+  --password 'current-password' \
+  --new-password 'new-password'
+```
+
+When either password option is omitted, keyben prompts securely. The client downloads and decrypts every secret in both `dev` and `prod`, re-encrypts each value with the new password, then asks the server to atomically replace all ciphertext and the project password verification hash. If any secret cannot be decrypted or the project changes during the reset, nothing is updated. For automation, the new password can also be provided through `KEYBEN_NEW_PASSWORD`.
 
 ### Set or overwrite a secret
 
@@ -189,7 +200,7 @@ keyben secrets set \
   --value 'postgres://user:password@db.example.com/app'
 ```
 
-The value is encrypted locally before the HTTP request is sent. `--env` accepts `dev` or `prod`.
+The value is encrypted locally before the HTTP request is sent. The project password is checked by the server before the ciphertext is stored. `--env` accepts `dev` or `prod`.
 
 ### Read one secret
 
@@ -245,7 +256,7 @@ Use `--insecure` only when the certificate is self-signed and the connection is 
 
 ## Data and recovery
 
-The server database contains projects and encrypted secret values. Back up the SQLite file regularly, along with the server configuration needed to operate it. The encryption password is not stored by keyben and cannot be recovered by the server; losing it makes the corresponding ciphertext unreadable.
+The server database contains project password verification hashes and encrypted secret values. Back up the SQLite file regularly, along with the server configuration needed to operate it. The encryption password is not stored by keyben and cannot be recovered by the server; losing it makes the corresponding ciphertext unreadable.
 
 Restoring a database does not require re-encrypting secrets. Restore the SQLite file, start the server with a compatible configuration, and use the original encryption password from the client.
 
