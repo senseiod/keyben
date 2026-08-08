@@ -9,7 +9,6 @@ use std::{collections::BTreeMap, process::Command as ProcessCommand, time::Durat
 use crate::{
     cli::{Cli, Command, Env, SecretsCommand},
     crypto,
-    protocol::{CreateProjectRequest, ProjectMetadata},
 };
 
 #[derive(Debug, Deserialize)]
@@ -33,9 +32,7 @@ pub async fn run(cli: Cli) -> Result<()> {
 
     match command {
         Command::Init { project_name } => {
-            let password = resolve_new_project_password(&cli.password)?;
-            let metadata = crypto::create_project_metadata(project_name, &password)?;
-            api.create_project(project_name, &metadata).await?;
+            api.create_project(project_name).await?;
             println!("Project `{project_name}` created");
         }
 
@@ -46,11 +43,9 @@ pub async fn run(cli: Cli) -> Result<()> {
                 name,
                 value,
             } => {
-                let key = unlock_project(&api, project_name, &cli.password).await?;
-                let name = resolve_secret_name(name)?;
-                let value = resolve_secret_value(value)?;
-                let blob = crypto::encrypt_secret(&key, project_name, env.as_str(), &name, &value)?;
-                api.set_secret(project_name, *env, &name, &blob).await?;
+                let password = resolve_password(&cli.password)?;
+                let blob = crypto::encrypt(&password, value)?;
+                api.set_secret(project_name, *env, name, &blob).await?;
                 println!("Set {name} in {project_name}/{}", env.as_str());
             }
 
@@ -59,12 +54,9 @@ pub async fn run(cli: Cli) -> Result<()> {
                 env,
                 name: Some(name),
             } => {
-                let key = unlock_project(&api, project_name, &cli.password).await?;
+                let password = resolve_password(&cli.password)?;
                 let blob = api.get_secret(project_name, *env, name).await?;
-                println!(
-                    "{}",
-                    crypto::decrypt_secret(&key, project_name, env.as_str(), name, &blob)?
-                );
+                println!("{}", crypto::decrypt(&password, &blob)?);
             }
 
             SecretsCommand::Get {
@@ -72,8 +64,8 @@ pub async fn run(cli: Cli) -> Result<()> {
                 env,
                 name: None,
             } => {
-                let key = unlock_project(&api, project_name, &cli.password).await?;
-                for (name, value) in api.fetch_all(project_name, *env, &key).await? {
+                let password = resolve_password(&cli.password)?;
+                for (name, value) in api.fetch_all(project_name, *env, &password).await? {
                     println!("{name}={value}");
                 }
             }
@@ -83,7 +75,6 @@ pub async fn run(cli: Cli) -> Result<()> {
                 env,
                 name,
             } => {
-                let _key = unlock_project(&api, project_name, &cli.password).await?;
                 api.delete_secret(project_name, *env, name).await?;
                 println!("Deleted {name} from {project_name}/{}", env.as_str());
             }
@@ -94,8 +85,8 @@ pub async fn run(cli: Cli) -> Result<()> {
             env,
             argv,
         } => {
-            let key = unlock_project(&api, project_name, &cli.password).await?;
-            let secrets = api.fetch_all(project_name, *env, &key).await?;
+            let password = resolve_password(&cli.password)?;
+            let secrets = api.fetch_all(project_name, *env, &password).await?;
             exec(argv, secrets)?;
         }
     }
@@ -103,70 +94,16 @@ pub async fn run(cli: Cli) -> Result<()> {
     Ok(())
 }
 
-async fn unlock_project(
-    api: &Api,
-    project: &str,
-    from_args: &Option<String>,
-) -> Result<crypto::ProjectKey> {
-    let metadata = api.get_project(project).await?;
-    let password = resolve_password(from_args)?;
-    crypto::unlock_project(project, &password, &metadata)
-}
-
-/// Resolve a secret name from the command line or prompt for it interactively.
-fn resolve_secret_name(from_args: &Option<String>) -> Result<String> {
-    if let Some(name) = from_args {
-        return Ok(name.clone());
-    }
-
-    dialoguer::Input::<String>::new()
-        .with_prompt("Enter the secret name")
-        .interact_text()
-        .context("Failed to read secret name (use --name in non-interactive environments)")
-}
-
-/// Resolve a secret value from the command line or prompt for it without echoing it.
-fn resolve_secret_value(from_args: &Option<String>) -> Result<String> {
-    if let Some(value) = from_args {
-        return Ok(value.clone());
-    }
-
-    dialoguer::Password::new()
-        .with_prompt("Enter the secret value")
-        .allow_empty_password(true)
-        .interact()
-        .context("Failed to read secret value (use --value in non-interactive environments)")
-}
-
-/// Resolve and confirm the password used to create a new project.
-fn resolve_new_project_password(from_args: &Option<String>) -> Result<String> {
-    if let Some(password) = from_args {
-        if password.is_empty() {
-            bail!("Project password cannot be empty");
-        }
-        return Ok(password.clone());
-    }
-
-    dialoguer::Password::new()
-        .with_prompt("Enter the new project password")
-        .with_confirmation("Confirm the new project password", "Project passwords do not match")
-        .interact()
-        .context("Failed to read project password (use --password or KEYBEN_PASSWORD in non-interactive environments)")
-}
-
-/// Resolve the project password from an argument or environment variable, otherwise prompt securely.
+/// Resolve the password from an argument or environment variable, otherwise prompt securely.
 fn resolve_password(from_args: &Option<String>) -> Result<String> {
     if let Some(password) = from_args {
-        if password.is_empty() {
-            bail!("Project password cannot be empty");
-        }
         return Ok(password.clone());
     }
 
     dialoguer::Password::new()
-        .with_prompt("Enter the project password")
+        .with_prompt("Enter the encryption/decryption password")
         .interact()
-        .context("Failed to read project password (use --password or KEYBEN_PASSWORD in non-interactive environments)")
+        .context("Failed to read password (use --password or KEYBEN_PASSWORD in non-interactive environments)")
 }
 
 /// Inject decrypted environment variables, launch the child process unchanged, and propagate its exit code.
@@ -271,24 +208,11 @@ impl Api {
         bail!("Server returned {status}: {detail}");
     }
 
-    async fn create_project(&self, project: &str, metadata: &ProjectMetadata) -> Result<()> {
+    async fn create_project(&self, project: &str) -> Result<()> {
         let url = format!("{}/api/projects", self.base);
-        let request = CreateProjectRequest {
-            name: project.to_owned(),
-            kdf: metadata.kdf.clone(),
-            verifier: metadata.verifier.clone(),
-        };
-        self.send(self.http.post(url).json(&request)).await?;
+        self.send(self.http.post(url).json(&json!({ "name": project })))
+            .await?;
         Ok(())
-    }
-
-    async fn get_project(&self, project: &str) -> Result<ProjectMetadata> {
-        let url = self.url(&[project]);
-        self.send(self.http.get(url))
-            .await?
-            .json()
-            .await
-            .context("Failed to parse project metadata")
     }
 
     async fn set_secret(&self, project: &str, env: Env, name: &str, blob: &str) -> Result<()> {
@@ -315,12 +239,12 @@ impl Api {
         Ok(())
     }
 
-    /// Fetch and decrypt all variables in an environment with a verified project key.
+    /// Fetch and decrypt all variables in an environment.
     async fn fetch_all(
         &self,
         project: &str,
         env: Env,
-        key: &crypto::ProjectKey,
+        password: &str,
     ) -> Result<BTreeMap<String, String>> {
         let url = self.url(&[project, env.as_str()]);
         let entries: Vec<SecretEntry> = self
@@ -333,9 +257,8 @@ impl Api {
         entries
             .into_iter()
             .map(|entry| {
-                let value =
-                    crypto::decrypt_secret(key, project, env.as_str(), &entry.name, &entry.value)
-                        .with_context(|| format!("Failed to decrypt variable `{}`", entry.name))?;
+                let value = crypto::decrypt(password, &entry.value)
+                    .with_context(|| format!("Failed to decrypt variable `{}`", entry.name))?;
                 Ok((entry.name, value))
             })
             .collect()

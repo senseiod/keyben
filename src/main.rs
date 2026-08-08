@@ -1,14 +1,13 @@
 //! keyben — an end-to-end encrypted environment variable manager (one binary for client and server).
 //!
 //! - `keyben -c <config.toml>`: run as the server for storage and Bearer Token authentication.
-//! - `keyben init | secrets | run`: run as the client for project-password-based encryption and decryption.
+//! - `keyben init | secrets | run`: run as the client for password-based encryption and decryption.
 //!
-//! The server never sees passwords or plaintext; the database contains only KDF metadata and authenticated ciphertext.
+//! The server never sees passwords or plaintext; the database contains only ChaCha20-Poly1305 ciphertext.
 
 mod cli;
 mod client;
 mod crypto;
-mod protocol;
 mod server;
 
 use anyhow::{Result, bail};

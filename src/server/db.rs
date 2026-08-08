@@ -1,27 +1,16 @@
 //! SQLite storage layer. The server performs only basic storage operations and treats values as opaque Base64 ciphertext.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use sqlx::{
     Row, SqlitePool,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
 use std::path::Path;
 
-use crate::protocol::{KdfConfig, ProjectMetadata};
-
-const SCHEMA_VERSION: i64 = 2;
-
 /// Schema containing only the `projects` and `secrets` tables.
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS projects (
-    name                 TEXT NOT NULL PRIMARY KEY,
-    kdf_algorithm        TEXT NOT NULL,
-    kdf_version          INTEGER NOT NULL,
-    kdf_memory_cost      INTEGER NOT NULL,
-    kdf_time_cost        INTEGER NOT NULL,
-    kdf_parallelism      INTEGER NOT NULL,
-    kdf_salt             TEXT NOT NULL,
-    password_verifier    TEXT NOT NULL
+    name TEXT NOT NULL PRIMARY KEY
 );
 
 CREATE TABLE IF NOT EXISTS secrets (
@@ -29,11 +18,8 @@ CREATE TABLE IF NOT EXISTS secrets (
     env          TEXT NOT NULL,
     name         TEXT NOT NULL,
     value        TEXT NOT NULL,
-    PRIMARY KEY (project_name, env, name),
-    FOREIGN KEY (project_name) REFERENCES projects(name) ON DELETE CASCADE
+    PRIMARY KEY (project_name, env, name)
 );
-
-PRAGMA user_version = 2;
 "#;
 
 #[derive(Clone)]
@@ -61,28 +47,6 @@ impl Db {
             .await
             .with_context(|| format!("Failed to open database: {}", path.display()))?;
 
-        let schema_version: i64 = sqlx::query_scalar::<_, i64>("PRAGMA user_version")
-            .fetch_one(&pool)
-            .await
-            .context("Failed to read database schema version")?;
-        let has_project_table: i64 = sqlx::query_scalar::<_, i64>(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'projects')",
-        )
-        .fetch_one(&pool)
-        .await
-        .context("Failed to inspect database schema")?;
-
-        if schema_version == 0 && has_project_table != 0 {
-            bail!(
-                "Legacy database schema detected; this version requires a new database file because project password metadata is not backward compatible"
-            );
-        }
-        if schema_version != 0 && schema_version != SCHEMA_VERSION {
-            bail!(
-                "Unsupported database schema version {schema_version}; expected {SCHEMA_VERSION}"
-            );
-        }
-
         sqlx::raw_sql(SCHEMA)
             .execute(&pool)
             .await
@@ -91,29 +55,13 @@ impl Db {
         Ok(Self { pool })
     }
 
-    /// Create a project and report whether a row was inserted.
-    pub async fn create_project(
-        &self,
-        name: &str,
-        metadata: &ProjectMetadata,
-    ) -> Result<bool, sqlx::Error> {
-        let result = sqlx::query(
-            "INSERT OR IGNORE INTO projects (
-                name, kdf_algorithm, kdf_version, kdf_memory_cost,
-                kdf_time_cost, kdf_parallelism, kdf_salt, password_verifier
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(name)
-        .bind(&metadata.kdf.algorithm)
-        .bind(i64::from(metadata.kdf.version))
-        .bind(i64::from(metadata.kdf.memory_cost))
-        .bind(i64::from(metadata.kdf.time_cost))
-        .bind(i64::from(metadata.kdf.parallelism))
-        .bind(&metadata.kdf.salt)
-        .bind(&metadata.verifier)
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected() > 0)
+    /// Create a project; this operation is idempotent if it already exists.
+    pub async fn create_project(&self, name: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("INSERT OR IGNORE INTO projects (name) VALUES (?)")
+            .bind(name)
+            .execute(&self.pool)
+            .await
+            .map(|_| ())
     }
 
     pub async fn project_exists(&self, name: &str) -> Result<bool, sqlx::Error> {
@@ -122,32 +70,6 @@ impl Db {
             .fetch_optional(&self.pool)
             .await?;
         Ok(row.is_some())
-    }
-
-    pub async fn get_project(&self, name: &str) -> Result<Option<ProjectMetadata>, sqlx::Error> {
-        let row = sqlx::query(
-            "SELECT kdf_algorithm, kdf_version, kdf_memory_cost, kdf_time_cost,
-                    kdf_parallelism, kdf_salt, password_verifier
-             FROM projects WHERE name = ?",
-        )
-        .bind(name)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        row.map(|row| {
-            Ok(ProjectMetadata {
-                kdf: KdfConfig {
-                    algorithm: row.try_get("kdf_algorithm")?,
-                    version: sqlite_u32(row.try_get("kdf_version")?, "kdf_version")?,
-                    memory_cost: sqlite_u32(row.try_get("kdf_memory_cost")?, "kdf_memory_cost")?,
-                    time_cost: sqlite_u32(row.try_get("kdf_time_cost")?, "kdf_time_cost")?,
-                    parallelism: sqlite_u32(row.try_get("kdf_parallelism")?, "kdf_parallelism")?,
-                    salt: row.try_get("kdf_salt")?,
-                },
-                verifier: row.try_get("password_verifier")?,
-            })
-        })
-        .transpose()
     }
 
     /// Write or overwrite a variable whose value is Base64 ciphertext from the client.
@@ -223,11 +145,4 @@ impl Db {
 
         Ok(result.rows_affected() > 0)
     }
-}
-
-fn sqlite_u32(value: i64, column: &'static str) -> Result<u32, sqlx::Error> {
-    u32::try_from(value).map_err(|err| sqlx::Error::ColumnDecode {
-        index: column.to_owned(),
-        source: Box::new(err),
-    })
 }
