@@ -15,7 +15,7 @@ use std::path::PathBuf;
     long_about = "keyben — an end-to-end encrypted environment variable manager.\n\n\
                   Server mode: keyben -c /etc/keyben/config.toml\n\
                   Client mode: keyben init | keyben secrets ... | keyben run ...\n\n\
-                  All encryption and decryption happen on the client (ChaCha20-Poly1305); the server stores only Base64 ciphertext.",
+                  All key derivation and encryption happen on the client (Argon2id + ChaCha20-Poly1305); the server stores only KDF metadata and Base64 ciphertext.",
     after_help = "Examples:\n  \
         keyben -c config.toml\n  \
         keyben --server http://127.0.0.1:8000 init --projectName myapp\n  \
@@ -42,7 +42,7 @@ pub struct Cli {
     )]
     pub token: Option<String>,
 
-    /// Encryption/decryption password; prompts securely when omitted.
+    /// Project password; prompts securely when omitted.
     #[arg(
         long,
         global = true,
@@ -71,7 +71,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Create a project on the server.
+    /// Create a password-protected project on the server.
     Init {
         /// Project name.
         #[arg(long = "projectName", value_name = "NAME")]
@@ -117,13 +117,13 @@ pub enum SecretsCommand {
         #[arg(long, value_enum)]
         env: Env,
 
-        /// Variable name.
+        /// Variable name; prompts interactively when omitted.
         #[arg(long, value_name = "KEY")]
-        name: String,
+        name: Option<String>,
 
-        /// Variable plaintext value.
+        /// Variable plaintext value; prompts securely when omitted.
         #[arg(long, value_name = "VALUE")]
-        value: String,
+        value: Option<String>,
     },
 
     /// Read and decrypt an environment variable; without --name, print all variables in the environment.
@@ -171,5 +171,88 @@ impl Env {
             Env::Dev => "dev",
             Env::Prod => "prod",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn set_allows_interactive_name_and_value() {
+        let cli = Cli::try_parse_from([
+            "keyben",
+            "--server",
+            "http://b-server.tailcab45.ts.net:4000",
+            "secrets",
+            "set",
+            "--env",
+            "dev",
+            "--projectName",
+            "frontierkings",
+            "--token",
+            "1234567",
+        ])
+        .unwrap();
+
+        let Some(Command::Secrets {
+            action: SecretsCommand::Set { name, value, .. },
+        }) = cli.command
+        else {
+            panic!("expected secrets set command");
+        };
+
+        assert!(name.is_none());
+        assert!(value.is_none());
+    }
+
+    #[test]
+    fn set_accepts_non_interactive_name_and_value() {
+        let cli = Cli::try_parse_from([
+            "keyben",
+            "secrets",
+            "set",
+            "--env",
+            "prod",
+            "--projectName",
+            "myapp",
+            "--name",
+            "API_TOKEN",
+            "--value",
+            "secret",
+        ])
+        .unwrap();
+
+        let Some(Command::Secrets {
+            action: SecretsCommand::Set { name, value, .. },
+        }) = cli.command
+        else {
+            panic!("expected secrets set command");
+        };
+
+        assert_eq!(name.as_deref(), Some("API_TOKEN"));
+        assert_eq!(value.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn global_project_password_is_accepted_after_get_options() {
+        let cli = Cli::try_parse_from([
+            "keyben",
+            "--server",
+            "http://b-server.tailcab45.ts.net:4000",
+            "secrets",
+            "get",
+            "--env",
+            "dev",
+            "--projectName",
+            "frontierkings",
+            "--token",
+            "123456",
+            "--password",
+            "123",
+        ])
+        .unwrap();
+
+        assert_eq!(cli.password.as_deref(), Some("123"));
     }
 }

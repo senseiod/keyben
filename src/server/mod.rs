@@ -9,6 +9,7 @@ use axum::{
     routing::{get, post},
 };
 use axum_server::{Handle, tls_rustls::RustlsConfig};
+use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{net::SocketAddr, path::Path, time::Duration};
@@ -19,6 +20,10 @@ use tower_http::{
 
 use config::Config;
 use db::Db;
+
+use crate::protocol::{
+    CreateProjectRequest, KdfConfig, PROJECT_SALT_LEN, PROJECT_VERIFIER_BLOB_LEN, ProjectMetadata,
+};
 
 mod config;
 mod db;
@@ -82,6 +87,7 @@ fn router(db: Db, auth_token: &str) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/api/projects", post(create_project))
+        .route("/api/projects/{project}", get(get_project))
         .route("/api/projects/{project}/{env}", get(list_secrets))
         .route(
             "/api/projects/{project}/{env}/{name}",
@@ -153,11 +159,6 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 // ---------------------------------------------------------------- Request/response bodies
 
-#[derive(Debug, Deserialize)]
-struct CreateProject {
-    name: String,
-}
-
 /// The value is always Base64 ciphertext encrypted by the client.
 #[derive(Debug, Deserialize, Serialize)]
 struct SecretValue {
@@ -174,15 +175,41 @@ struct SecretEntry {
 
 async fn create_project(
     State(db): State<Db>,
-    Json(body): Json<CreateProject>,
+    Json(body): Json<CreateProjectRequest>,
 ) -> Result<StatusCode, ApiError> {
-    let name = body.name.trim();
+    let CreateProjectRequest {
+        name,
+        kdf,
+        verifier,
+    } = body;
+    let name = name.trim();
     if name.is_empty() {
         return Err(ApiError::bad_request("Project name cannot be empty"));
     }
+    validate_project_metadata(&kdf, &verifier)?;
 
-    db.create_project(name).await?;
-    Ok(StatusCode::CREATED)
+    let metadata = ProjectMetadata { kdf, verifier };
+    if db.create_project(name, &metadata).await? {
+        Ok(StatusCode::CREATED)
+    } else {
+        Err(ApiError::conflict(format!(
+            "Project `{name}` already exists"
+        )))
+    }
+}
+
+async fn get_project(
+    State(db): State<Db>,
+    AxumPath(project): AxumPath<String>,
+) -> Result<Json<ProjectMetadata>, ApiError> {
+    if project.trim().is_empty() {
+        return Err(ApiError::bad_request("Project name cannot be empty"));
+    }
+
+    db.get_project(&project)
+        .await?
+        .map(Json)
+        .ok_or_else(|| ApiError::not_found(format!("Project `{project}` does not exist")))
 }
 
 async fn set_secret(
@@ -264,6 +291,56 @@ fn validate_project_and_env(project: &str, env: &str, name: Option<&str>) -> Res
     Ok(())
 }
 
+fn validate_project_metadata(kdf: &KdfConfig, verifier: &str) -> Result<(), ApiError> {
+    if !kdf.is_supported() {
+        return Err(ApiError::bad_request(
+            "Unsupported project KDF configuration",
+        ));
+    }
+
+    let salt = B64
+        .decode(&kdf.salt)
+        .map_err(|_| ApiError::bad_request("Project KDF salt must be valid Base64"))?;
+    if salt.len() != PROJECT_SALT_LEN {
+        return Err(ApiError::bad_request(format!(
+            "Project KDF salt must decode to {PROJECT_SALT_LEN} bytes"
+        )));
+    }
+
+    let verifier = B64
+        .decode(verifier)
+        .map_err(|_| ApiError::bad_request("Project verifier must be valid Base64"))?;
+    if verifier.len() != PROJECT_VERIFIER_BLOB_LEN {
+        return Err(ApiError::bad_request(
+            "Project verifier has an invalid length",
+        ));
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_supported_project_metadata() {
+        let kdf = KdfConfig::argon2id(B64.encode([0x11; 16]));
+        let verifier = B64.encode([0x22; PROJECT_VERIFIER_BLOB_LEN]);
+        assert!(validate_project_metadata(&kdf, &verifier).is_ok());
+    }
+
+    #[test]
+    fn rejects_untrusted_kdf_parameters() {
+        let mut kdf = KdfConfig::argon2id(B64.encode([0x11; 16]));
+        kdf.memory_cost *= 2;
+        assert!(
+            validate_project_metadata(&kdf, &B64.encode([0x22; PROJECT_VERIFIER_BLOB_LEN]))
+                .is_err()
+        );
+    }
+}
+
 // --------------------------------------------------------------------- Errors
 
 /// Consistent JSON error response: `{"error": "..."}`.
@@ -283,6 +360,13 @@ impl ApiError {
     fn not_found(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
+            message: message.into(),
+        }
+    }
+
+    fn conflict(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
             message: message.into(),
         }
     }
