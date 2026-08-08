@@ -57,8 +57,10 @@ pub async fn run(cli: Cli) -> Result<()> {
                 value,
             } => {
                 let password = resolve_password(&cli.password)?;
-                let blob = crypto::encrypt(&password, value)?;
-                api.set_secret(project_name, *env, name, &blob, &password)
+                let name = resolve_secret_name(name)?;
+                let value = resolve_secret_value(value)?;
+                let blob = crypto::encrypt(&password, &value)?;
+                api.set_secret(project_name, *env, &name, &blob, &password)
                     .await?;
                 println!("Set {name} in {project_name}/{}", env.as_str());
             }
@@ -134,6 +136,32 @@ fn resolve_password(from_args: &Option<String>) -> Result<String> {
         .with_prompt("Enter the project password")
         .interact()
         .context("Failed to read password (use --password or KEYBEN_PASSWORD in non-interactive environments)")
+}
+
+fn resolve_secret_name(from_args: &Option<String>) -> Result<String> {
+    let name = match from_args {
+        Some(name) => name.clone(),
+        None => dialoguer::Input::<String>::new()
+            .with_prompt("Enter the secret name")
+            .interact_text()
+            .context("Failed to read secret name (use --name in non-interactive environments)")?,
+    };
+    if name.trim().is_empty() {
+        bail!("Secret name cannot be empty");
+    }
+    Ok(name)
+}
+
+fn resolve_secret_value(from_args: &Option<String>) -> Result<String> {
+    if let Some(value) = from_args {
+        return Ok(value.clone());
+    }
+
+    dialoguer::Password::new()
+        .with_prompt("Enter the secret value")
+        .allow_empty_password(true)
+        .interact()
+        .context("Failed to read secret value (use --value in non-interactive environments)")
 }
 
 fn resolve_new_password(from_args: Option<&String>, prompt: &str, usage: &str) -> Result<String> {

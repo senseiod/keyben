@@ -124,13 +124,13 @@ pub enum SecretsCommand {
         #[arg(long, value_enum)]
         env: Env,
 
-        /// Variable name.
+        /// Variable name; prompts interactively when omitted.
         #[arg(long, value_name = "KEY")]
-        name: String,
+        name: Option<String>,
 
-        /// Variable plaintext value.
+        /// Variable plaintext value; prompts securely when omitted.
         #[arg(long, value_name = "VALUE")]
-        value: String,
+        value: Option<String>,
     },
 
     /// Read and decrypt an environment variable; without --name, print all variables in the environment.
@@ -254,5 +254,28 @@ mod tests {
         assert_eq!(project_name, "frontierkings");
         assert_eq!(new_password.as_deref(), Some("new-password"));
         assert_eq!(cli.password.as_deref(), Some("old-password"));
+    }
+
+    #[test]
+    fn secrets_set_allows_omitting_name_and_value() {
+        let cli = Cli::try_parse_from([
+            "keyben",
+            "secrets",
+            "set",
+            "--projectName",
+            "frontierkings",
+            "--env",
+            "dev",
+        ])
+        .unwrap();
+
+        let Command::Secrets {
+            action: SecretsCommand::Set { name, value, .. },
+        } = cli.command.unwrap()
+        else {
+            panic!("expected secrets set command");
+        };
+        assert_eq!(name, None);
+        assert_eq!(value, None);
     }
 }

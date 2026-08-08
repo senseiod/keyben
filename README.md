@@ -202,6 +202,12 @@ keyben secrets set \
 
 The value is encrypted locally before the HTTP request is sent. The project password is checked by the server before the ciphertext is stored. `--env` accepts `dev` or `prod`.
 
+Both `--name` and `--value` are optional in an interactive terminal. When omitted, keyben prompts for the variable name and reads the value without echoing it:
+
+```bash
+keyben secrets set --projectName myapp --env dev
+```
+
 ### Read one secret
 
 ```bash
