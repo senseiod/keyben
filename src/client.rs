@@ -1,4 +1,4 @@
-//! 客户端：所有加解密都在这里完成，服务端只收发 Base64 密文。
+//! Client: all encryption and decryption happen here; the server only sends and receives Base64 ciphertext.
 
 use anyhow::{Context, Result, bail};
 use reqwest::{RequestBuilder, Response, StatusCode};
@@ -22,15 +22,18 @@ struct SecretEntry {
     value: String,
 }
 
-/// 以客户端模式执行子命令。
+/// Execute a subcommand in client mode.
 pub async fn run(cli: Cli) -> Result<()> {
-    let command = cli.command.as_ref().expect("调用方已确认存在子命令");
+    let command = cli
+        .command
+        .as_ref()
+        .expect("the caller verified that a subcommand exists");
     let api = Api::new(cli.server.as_deref(), cli.token.as_deref(), cli.insecure)?;
 
     match command {
         Command::Init { project_name } => {
             api.create_project(project_name).await?;
-            println!("项目 `{project_name}` 已创建");
+            println!("Project `{project_name}` created");
         }
 
         Command::Secrets { action } => match action {
@@ -43,7 +46,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 let password = resolve_password(&cli.password)?;
                 let blob = crypto::encrypt(&password, value)?;
                 api.set_secret(project_name, *env, name, &blob).await?;
-                println!("已写入 {project_name}/{} 的 {name}", env.as_str());
+                println!("Set {name} in {project_name}/{}", env.as_str());
             }
 
             SecretsCommand::Get {
@@ -73,7 +76,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 name,
             } => {
                 api.delete_secret(project_name, *env, name).await?;
-                println!("已删除 {project_name}/{} 的 {name}", env.as_str());
+                println!("Deleted {name} from {project_name}/{}", env.as_str());
             }
         },
 
@@ -91,31 +94,32 @@ pub async fn run(cli: Cli) -> Result<()> {
     Ok(())
 }
 
-/// 取密码：优先命令行/环境变量，否则交互式隐藏输入。
+/// Resolve the password from an argument or environment variable, otherwise prompt securely.
 fn resolve_password(from_args: &Option<String>) -> Result<String> {
     if let Some(password) = from_args {
         return Ok(password.clone());
     }
 
     dialoguer::Password::new()
-        .with_prompt("请输入加解密密码")
+        .with_prompt("Enter the encryption/decryption password")
         .interact()
-        .context("读取密码失败（非交互式环境请使用 --password 或 KEYBEN_PASSWORD）")
+        .context("Failed to read password (use --password or KEYBEN_PASSWORD in non-interactive environments)")
 }
 
-/// 注入解密后的环境变量并原封不动拉起子进程，透传其退出码。
+/// Inject decrypted environment variables, launch the child process unchanged, and propagate its exit code.
 fn exec(argv: &[String], secrets: BTreeMap<String, String>) -> Result<()> {
     let (program, args) = argv
         .split_first()
-        .context("`--` 之后必须给出要执行的程序")?;
+        .context("A program to execute must be provided after `--`")?;
 
     let status = ProcessCommand::new(program)
         .args(args)
         .envs(&secrets)
         .status()
-        .with_context(|| format!("无法执行 `{program}`"))?;
+        .with_context(|| format!("Failed to execute `{program}`"))?;
 
-    // 子进程被信号终止时（status.code() 为 None）按惯例返回 128 + signo。
+    // When a signal terminates the child (status.code() is None), conventionally
+    // return 128 + the signal number.
     let code = status.code().unwrap_or_else(|| {
         #[cfg(unix)]
         {
@@ -131,7 +135,7 @@ fn exec(argv: &[String], secrets: BTreeMap<String, String>) -> Result<()> {
     std::process::exit(code);
 }
 
-// --------------------------------------------------------------- HTTP 客户端
+// --------------------------------------------------------------- HTTP client
 
 struct Api {
     http: reqwest::Client,
@@ -144,26 +148,26 @@ impl Api {
         let base = server
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .context("缺少服务端地址，请使用 --server 或设置 KEYBEN_SERVER")?
+            .context("Missing server URL; use --server or set KEYBEN_SERVER")?
             .trim_end_matches('/')
             .to_owned();
 
         let token = token
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .context("缺少鉴权 Token，请使用 --token 或设置 KEYBEN_TOKEN")?
+            .context("Missing authentication token; use --token or set KEYBEN_TOKEN")?
             .to_owned();
 
         let http = reqwest::Client::builder()
             .danger_accept_invalid_certs(insecure)
             .timeout(Duration::from_secs(30))
             .build()
-            .context("构建 HTTP 客户端失败")?;
+            .context("Failed to build HTTP client")?;
 
         Ok(Self { http, base, token })
     }
 
-    /// 拼接 URL，路径片段做百分号编码，避免变量名含特殊字符时出错。
+    /// Build a URL and percent-encode path segments so special characters in variable names work.
     fn url(&self, segments: &[&str]) -> String {
         let mut url = format!("{}/api/projects", self.base);
         for segment in segments {
@@ -173,13 +177,13 @@ impl Api {
         url
     }
 
-    /// 发请求并把非 2xx 状态码翻译成可读错误。
+    /// Send a request and translate non-2xx status codes into readable errors.
     async fn send(&self, request: RequestBuilder) -> Result<Response> {
         let response = request
             .bearer_auth(&self.token)
             .send()
             .await
-            .with_context(|| format!("请求服务端失败: {}", self.base))?;
+            .with_context(|| format!("Request to server failed: {}", self.base))?;
 
         let status = response.status();
         if status.is_success() {
@@ -187,7 +191,9 @@ impl Api {
         }
 
         if status == StatusCode::UNAUTHORIZED {
-            bail!("鉴权失败 (401)：Token 与服务端 config.toml 中的 auth_token 不一致");
+            bail!(
+                "Authentication failed (401): the token does not match auth_token in the server's config.toml"
+            );
         }
 
         let body = response.text().await.unwrap_or_default();
@@ -197,9 +203,9 @@ impl Api {
             .unwrap_or(body);
 
         if detail.trim().is_empty() {
-            bail!("服务端返回 {status}");
+            bail!("Server returned {status}");
         }
-        bail!("服务端返回 {status}: {detail}");
+        bail!("Server returned {status}: {detail}");
     }
 
     async fn create_project(&self, project: &str) -> Result<()> {
@@ -223,7 +229,7 @@ impl Api {
             .await?
             .json()
             .await
-            .context("解析服务端响应失败")?;
+            .context("Failed to parse server response")?;
         Ok(payload.value)
     }
 
@@ -233,7 +239,7 @@ impl Api {
         Ok(())
     }
 
-    /// 拉取并解密某环境下的全部变量。
+    /// Fetch and decrypt all variables in an environment.
     async fn fetch_all(
         &self,
         project: &str,
@@ -246,20 +252,20 @@ impl Api {
             .await?
             .json()
             .await
-            .context("解析服务端响应失败")?;
+            .context("Failed to parse server response")?;
 
         entries
             .into_iter()
             .map(|entry| {
                 let value = crypto::decrypt(password, &entry.value)
-                    .with_context(|| format!("解密变量 `{}` 失败", entry.name))?;
+                    .with_context(|| format!("Failed to decrypt variable `{}`", entry.name))?;
                 Ok((entry.name, value))
             })
             .collect()
     }
 }
 
-/// 按 RFC 3986 对单个 URL 路径片段做百分号编码。
+/// Percent-encode a single URL path segment according to RFC 3986.
 fn percent_encode(segment: &str) -> String {
     let mut encoded = String::with_capacity(segment.len());
     for byte in segment.bytes() {
@@ -281,6 +287,6 @@ mod tests {
     fn encodes_reserved_characters() {
         assert_eq!(percent_encode("DB_URL"), "DB_URL");
         assert_eq!(percent_encode("a/b c"), "a%2Fb%20c");
-        assert_eq!(percent_encode("中"), "%E4%B8%AD");
+        assert_eq!(percent_encode("é"), "%C3%A9");
     }
 }

@@ -1,33 +1,33 @@
-//! 客户端侧的端到端加解密：ChaCha20-Poly1305 + SHA-256 派生密钥。
+//! Client-side end-to-end encryption: ChaCha20-Poly1305 with a SHA-256-derived key.
 //!
-//! 存储格式（Base64 编码后上传服务端）：
-//! `[12 字节 Nonce] + [密文 || 16 字节 Poly1305 认证标签]`
+//! Storage format (uploaded to the server after Base64 encoding):
+//! `[12-byte nonce] + [ciphertext || 16-byte Poly1305 authentication tag]`
 //!
-//! 服务端只看到 Base64 字符串，永远接触不到密码与明文。
+//! The server sees only the Base64 string and never handles passwords or plaintext.
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use chacha20poly1305::{ChaCha20Poly1305, Key, KeyInit, Nonce, aead::Aead};
 use sha2::{Digest, Sha256};
 
-/// ChaCha20-Poly1305 的 Nonce 长度（字节）。
+/// ChaCha20-Poly1305 nonce length in bytes.
 const NONCE_LEN: usize = 12;
-/// Poly1305 认证标签长度（字节）。
+/// Poly1305 authentication tag length in bytes.
 const TAG_LEN: usize = 16;
 
-/// 用 SHA-256 把任意长度的密码哈希成 32 字节对称密钥。
+/// Hash a password of any length into a 32-byte symmetric key with SHA-256.
 fn cipher_for(password: &str) -> ChaCha20Poly1305 {
     let key_bytes: [u8; 32] = Sha256::digest(password.as_bytes()).into();
     ChaCha20Poly1305::new(&Key::from(key_bytes))
 }
 
-/// 加密明文，返回 Base64 编码的 `Nonce || 密文 || Tag`。
+/// Encrypt plaintext and return the Base64-encoded `nonce || ciphertext || tag`.
 pub fn encrypt(password: &str, plaintext: &str) -> Result<String> {
     let nonce_bytes: [u8; NONCE_LEN] = rand::random();
 
     let ciphertext = cipher_for(password)
         .encrypt(&Nonce::from(nonce_bytes), plaintext.as_bytes())
-        .map_err(|_| anyhow!("加密失败"))?;
+        .map_err(|_| anyhow!("Encryption failed"))?;
 
     let mut blob = Vec::with_capacity(NONCE_LEN + ciphertext.len());
     blob.extend_from_slice(&nonce_bytes);
@@ -36,24 +36,27 @@ pub fn encrypt(password: &str, plaintext: &str) -> Result<String> {
     Ok(B64.encode(blob))
 }
 
-/// 解密 [`encrypt`] 产出的 Base64 字符串。
+/// Decrypt a Base64 string produced by [`encrypt`].
 pub fn decrypt(password: &str, blob: &str) -> Result<String> {
     let raw = B64
         .decode(blob.trim())
-        .context("Base64 解码失败：数据不是本工具写入的格式")?;
+        .context("Base64 decoding failed: the data was not written by this tool")?;
 
     if raw.len() < NONCE_LEN + TAG_LEN {
-        bail!("密文长度不足 {} 字节，数据已损坏", NONCE_LEN + TAG_LEN);
+        bail!(
+            "Ciphertext is shorter than {} bytes; the data is corrupted",
+            NONCE_LEN + TAG_LEN
+        );
     }
 
     let (nonce_bytes, ciphertext) = raw.split_at(NONCE_LEN);
-    let nonce = Nonce::try_from(nonce_bytes).expect("已校验长度为 12 字节");
+    let nonce = Nonce::try_from(nonce_bytes).expect("length was validated as 12 bytes");
 
     let plaintext = cipher_for(password)
         .decrypt(&nonce, ciphertext)
-        .map_err(|_| anyhow!("解密失败：密码错误或数据已被篡改"))?;
+        .map_err(|_| anyhow!("Decryption failed: incorrect password or tampered data"))?;
 
-    String::from_utf8(plaintext).context("解密结果不是合法的 UTF-8 文本")
+    String::from_utf8(plaintext).context("Decrypted result is not valid UTF-8 text")
 }
 
 #[cfg(test)]
@@ -73,7 +76,7 @@ mod tests {
     fn nonce_is_random_so_ciphertexts_differ() {
         let a = encrypt("pw", "same").unwrap();
         let b = encrypt("pw", "same").unwrap();
-        assert_ne!(a, b, "每次加密都应使用新的随机 Nonce");
+        assert_ne!(a, b, "each encryption should use a fresh random nonce");
         assert_eq!(decrypt("pw", &a).unwrap(), decrypt("pw", &b).unwrap());
     }
 
@@ -93,7 +96,7 @@ mod tests {
 
     #[test]
     fn empty_and_unicode_values() {
-        for value in ["", "🔑 中文 值", "multi\nline"] {
+        for value in ["", "🔑 Unicode value", "multi\nline"] {
             let blob = encrypt("pw", value).unwrap();
             assert_eq!(decrypt("pw", &blob).unwrap(), value);
         }

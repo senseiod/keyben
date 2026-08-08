@@ -1,7 +1,4 @@
-//! 服务端：Axum + SQLite。只做存储与 Token 鉴权，不感知密码与明文。
-
-mod config;
-mod db;
+//! Server: Axum + SQLite. It only handles storage and token authentication, never passwords or plaintext.
 
 use anyhow::{Context, Result};
 use axum::{
@@ -23,7 +20,10 @@ use tower_http::{
 use config::Config;
 use db::Db;
 
-/// 以服务端模式运行。
+mod config;
+mod db;
+
+/// Run in server mode.
 pub async fn run(config_path: &Path) -> Result<()> {
     let config = Config::load(config_path)?;
 
@@ -31,7 +31,7 @@ pub async fn run(config_path: &Path) -> Result<()> {
         .server
         .listen
         .parse()
-        .with_context(|| format!("无法解析监听地址: {}", config.server.listen))?;
+        .with_context(|| format!("Failed to parse listen address: {}", config.server.listen))?;
 
     let db = Db::open(&config.server.data).await?;
     let app = router(db, &config.server.auth_token);
@@ -45,14 +45,14 @@ pub async fn run(config_path: &Path) -> Result<()> {
                 .await
                 .with_context(|| {
                     format!(
-                        "加载 TLS 证书失败: cert={}, key={}",
+                        "Failed to load TLS certificate: cert={}, key={}",
                         cert.display(),
                         key.display()
                     )
                 })?;
 
             tracing::info!(
-                "keyben-server 已启动: https://{addr} (数据库: {})",
+                "keyben-server started: https://{addr} (database: {})",
                 config.server.data.display()
             );
             axum_server::bind_rustls(addr, tls)
@@ -62,11 +62,11 @@ pub async fn run(config_path: &Path) -> Result<()> {
         }
         None => {
             tracing::info!(
-                "keyben-server 已启动: http://{addr} (数据库: {})",
+                "keyben-server started: http://{addr} (database: {})",
                 config.server.data.display()
             );
             tracing::warn!(
-                "未配置 cert/key，正在以明文 HTTP 运行；请确保仅暴露于 Tailscale 等可信内网"
+                "No cert/key configured; running over plaintext HTTP. Only expose this server on a trusted private network such as Tailscale"
             );
             axum_server::bind(addr)
                 .handle(handle)
@@ -74,10 +74,10 @@ pub async fn run(config_path: &Path) -> Result<()> {
                 .await
         }
     }
-    .context("服务端运行出错")
+    .context("Server failed")
 }
 
-/// 所有接口（包括 `/healthz`）都经过 Bearer Token 校验。
+/// Protect every endpoint, including `/healthz`, with Bearer Token authentication.
 fn router(db: Db, auth_token: &str) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
@@ -87,7 +87,7 @@ fn router(db: Db, auth_token: &str) -> Router {
             "/api/projects/{project}/{env}/{name}",
             get(get_secret).put(set_secret).delete(delete_secret),
         )
-        // 所有 HTTP 接口（包括 healthz）都使用同一个 Token 保护。
+        // Protect every HTTP endpoint, including healthz, with the same token.
         .layer(ValidateRequestHeaderLayer::custom(BearerAuth::new(
             auth_token,
         )))
@@ -97,14 +97,14 @@ fn router(db: Db, auth_token: &str) -> Router {
 
 async fn shutdown_signal(handle: Handle<SocketAddr>) {
     if tokio::signal::ctrl_c().await.is_ok() {
-        tracing::info!("收到中断信号，正在关闭…");
+        tracing::info!("Interrupt received; shutting down...");
         handle.graceful_shutdown(Some(Duration::from_secs(5)));
     }
 }
 
-// --------------------------------------------------------------------- 鉴权
+// --------------------------------------------------------------------- Authentication
 
-/// 校验 `Authorization: Bearer <token>`，与 config.toml 中的 auth_token 逐字节比对。
+/// Validate `Authorization: Bearer <token>` against auth_token in config.toml byte by byte.
 #[derive(Clone)]
 struct BearerAuth {
     expected: String,
@@ -133,14 +133,14 @@ impl<B> ValidateRequest<B> for BearerAuth {
         } else {
             Err(ApiError {
                 status: StatusCode::UNAUTHORIZED,
-                message: "缺少或错误的 Authorization: Bearer <token>".to_owned(),
+                message: "Missing or invalid Authorization: Bearer <token>".to_owned(),
             }
             .into_response())
         }
     }
 }
 
-/// 定长比较，避免按字节提前返回而泄露 Token 前缀信息。
+/// Compare in constant time to avoid leaking token prefix information through early returns.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     let mut diff = (a.len() ^ b.len()) as u64;
     for index in 0..a.len().max(b.len()) {
@@ -151,14 +151,14 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-// ---------------------------------------------------------------- 请求/响应体
+// ---------------------------------------------------------------- Request/response bodies
 
 #[derive(Debug, Deserialize)]
 struct CreateProject {
     name: String,
 }
 
-/// value 始终是客户端加密后的 Base64 密文。
+/// The value is always Base64 ciphertext encrypted by the client.
 #[derive(Debug, Deserialize, Serialize)]
 struct SecretValue {
     value: String,
@@ -170,7 +170,7 @@ struct SecretEntry {
     value: String,
 }
 
-// ------------------------------------------------------------------- 处理函数
+// ------------------------------------------------------------------- Handlers
 
 async fn create_project(
     State(db): State<Db>,
@@ -178,7 +178,7 @@ async fn create_project(
 ) -> Result<StatusCode, ApiError> {
     let name = body.name.trim();
     if name.is_empty() {
-        return Err(ApiError::bad_request("项目名不能为空"));
+        return Err(ApiError::bad_request("Project name cannot be empty"));
     }
 
     db.create_project(name).await?;
@@ -193,7 +193,7 @@ async fn set_secret(
     validate_project_and_env(&project, &env, Some(&name))?;
     if !db.project_exists(&project).await? {
         return Err(ApiError::not_found(format!(
-            "项目 `{project}` 不存在，请先执行 keyben init --projectName {project}"
+            "Project `{project}` does not exist; run keyben init --projectName {project} first"
         )));
     }
 
@@ -209,7 +209,7 @@ async fn get_secret(
     match db.get_secret(&project, &env, &name).await? {
         Some(value) => Ok(Json(SecretValue { value })),
         None => Err(ApiError::not_found(format!(
-            "变量 `{name}` 在 {project}/{env} 中不存在"
+            "Secret `{name}` does not exist in {project}/{env}"
         ))),
     }
 }
@@ -220,7 +220,9 @@ async fn list_secrets(
 ) -> Result<Json<Vec<SecretEntry>>, ApiError> {
     validate_project_and_env(&project, &env, None)?;
     if !db.project_exists(&project).await? {
-        return Err(ApiError::not_found(format!("项目 `{project}` 不存在")));
+        return Err(ApiError::not_found(format!(
+            "Project `{project}` does not exist"
+        )));
     }
 
     let secrets = db
@@ -242,29 +244,29 @@ async fn delete_secret(
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(ApiError::not_found(format!(
-            "变量 `{name}` 在 {project}/{env} 中不存在"
+            "Secret `{name}` does not exist in {project}/{env}"
         )))
     }
 }
 
 fn validate_project_and_env(project: &str, env: &str, name: Option<&str>) -> Result<(), ApiError> {
     if project.trim().is_empty() {
-        return Err(ApiError::bad_request("项目名不能为空"));
+        return Err(ApiError::bad_request("Project name cannot be empty"));
     }
     if !matches!(env, "dev" | "prod") {
-        return Err(ApiError::bad_request("环境必须是 dev 或 prod"));
+        return Err(ApiError::bad_request("Environment must be 'dev' or 'prod'"));
     }
     if let Some(name) = name
         && name.trim().is_empty()
     {
-        return Err(ApiError::bad_request("变量名不能为空"));
+        return Err(ApiError::bad_request("Secret name cannot be empty"));
     }
     Ok(())
 }
 
-// --------------------------------------------------------------------- 错误
+// --------------------------------------------------------------------- Errors
 
-/// 统一的 JSON 错误响应：`{"error": "..."}`。
+/// Consistent JSON error response: `{"error": "..."}`.
 struct ApiError {
     status: StatusCode,
     message: String,
@@ -288,10 +290,10 @@ impl ApiError {
 
 impl From<sqlx::Error> for ApiError {
     fn from(err: sqlx::Error) -> Self {
-        tracing::error!("数据库错误: {err}");
+        tracing::error!("Database error: {err}");
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
-            message: "数据库错误".to_owned(),
+            message: "Database error".to_owned(),
         }
     }
 }

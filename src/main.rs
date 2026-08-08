@@ -1,9 +1,9 @@
-//! keyben —— 端到端加密的环境变量管理工具（单二进制：客户端 + 服务端）。
+//! keyben — an end-to-end encrypted environment variable manager (one binary for client and server).
 //!
-//! - `keyben -c <config.toml>`：以服务端运行，只做存储与 Bearer Token 鉴权。
-//! - `keyben init | secrets | run`：以客户端运行，负责基于密码的加解密。
+//! - `keyben -c <config.toml>`: run as the server for storage and Bearer Token authentication.
+//! - `keyben init | secrets | run`: run as the client for password-based encryption and decryption.
 //!
-//! 服务端永远接触不到密码与明文，数据库里躺着的只是 ChaCha20-Poly1305 密文。
+//! The server never sees passwords or plaintext; the database contains only ChaCha20-Poly1305 ciphertext.
 
 mod cli;
 mod client;
@@ -17,7 +17,7 @@ use cli::Cli;
 #[tokio::main]
 async fn main() {
     if let Err(err) = dispatch().await {
-        eprintln!("错误: {err:#}");
+        eprintln!("Error: {err:#}");
         std::process::exit(1);
     }
 }
@@ -25,7 +25,8 @@ async fn main() {
 async fn dispatch() -> Result<()> {
     let cli = Cli::parse();
 
-    // 进程内同时链接了多个 rustls 后端时需显式指定，否则首次建连会 panic。
+    // When multiple rustls backends are linked into the process, explicitly select one
+    // to avoid a panic on the first connection.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     match (&cli.config, &cli.command) {
@@ -34,7 +35,7 @@ async fn dispatch() -> Result<()> {
             server::run(config).await
         }
         (Some(_), Some(_)) => {
-            bail!("-c/--config 用于以服务端模式运行，不能与客户端子命令同时使用")
+            bail!("-c/--config runs the server and cannot be used with a client subcommand")
         }
         (None, Some(_)) => client::run(cli).await,
         (None, None) => {
@@ -45,7 +46,7 @@ async fn dispatch() -> Result<()> {
     }
 }
 
-/// 仅服务端需要日志；默认 info 级别，可用 RUST_LOG 覆盖。
+/// Only the server needs logging; the default level is info and can be overridden with RUST_LOG.
 fn init_tracing() {
     use tracing_subscriber::{EnvFilter, fmt};
 

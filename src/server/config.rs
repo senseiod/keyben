@@ -1,4 +1,4 @@
-//! 服务端配置文件（config.toml）解析。
+//! Server configuration file (`config.toml`) parsing.
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -11,20 +11,20 @@ pub struct Config {
 
 #[derive(Debug, Deserialize)]
 pub struct ServerConfig {
-    /// 监听地址，例如 "0.0.0.0:8000"
+    /// Listening address, such as "0.0.0.0:8000".
     pub listen: String,
 
-    /// SQLite 数据库文件路径
+    /// SQLite database file path.
     pub data: PathBuf,
 
-    /// HTTP API 鉴权凭证（Authorization: Bearer <token>）
+    /// HTTP API authentication token (`Authorization: Bearer <token>`).
     pub auth_token: String,
 
-    /// TLS 证书（PEM）；与 key 同时提供才启用 TLS
+    /// TLS certificate (PEM); provide it with a private key to enable TLS.
     #[serde(default)]
     pub cert: Option<PathBuf>,
 
-    /// TLS 私钥（PEM）
+    /// TLS private key (PEM).
     #[serde(default)]
     pub key: Option<PathBuf>,
 }
@@ -32,10 +32,10 @@ pub struct ServerConfig {
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
-            .with_context(|| format!("读取配置文件失败: {}", path.display()))?;
+            .with_context(|| format!("Failed to read config file: {}", path.display()))?;
 
         let config: Config = toml::from_str(&text)
-            .with_context(|| format!("解析配置文件失败: {}", path.display()))?;
+            .with_context(|| format!("Failed to parse config file: {}", path.display()))?;
 
         config.validate()?;
         Ok(config)
@@ -43,19 +43,25 @@ impl Config {
 
     fn validate(&self) -> Result<()> {
         if self.server.auth_token.trim().is_empty() {
-            bail!("config.toml 中的 server.auth_token 不能为空，否则任何人都能读写数据");
+            bail!(
+                "server.auth_token in config.toml must not be empty; otherwise anyone can read and write data"
+            );
         }
 
         match (&self.server.cert, &self.server.key) {
-            (Some(_), None) => bail!("提供了 server.cert 但缺少 server.key，无法启用 TLS"),
-            (None, Some(_)) => bail!("提供了 server.key 但缺少 server.cert，无法启用 TLS"),
+            (Some(_), None) => {
+                bail!("server.cert is set but server.key is missing; TLS cannot be enabled")
+            }
+            (None, Some(_)) => {
+                bail!("server.key is set but server.cert is missing; TLS cannot be enabled")
+            }
             _ => {}
         }
 
         Ok(())
     }
 
-    /// 同时配置了证书与私钥时返回 TLS 文件对。
+    /// Return the TLS file pair when both a certificate and private key are configured.
     pub fn tls_pair(&self) -> Option<(&Path, &Path)> {
         match (&self.server.cert, &self.server.key) {
             (Some(cert), Some(key)) => Some((cert.as_path(), key.as_path())),

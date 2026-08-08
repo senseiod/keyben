@@ -1,4 +1,4 @@
-//! SQLite 存储层。服务端只做极简存取，不理解 value 的内容（Base64 密文）。
+//! SQLite storage layer. The server performs only basic storage operations and treats values as opaque Base64 ciphertext.
 
 use anyhow::{Context, Result};
 use sqlx::{
@@ -7,7 +7,7 @@ use sqlx::{
 };
 use std::path::Path;
 
-/// 建表语句：只有 projects 与 secrets 两张表。
+/// Schema containing only the `projects` and `secrets` tables.
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS projects (
     name TEXT NOT NULL PRIMARY KEY
@@ -28,11 +28,12 @@ pub struct Db {
 }
 
 impl Db {
-    /// 打开（必要时创建）数据库文件并建表。
+    /// Open or create the database file and initialize its schema.
     pub async fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("创建数据目录失败: {}", parent.display()))?;
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("Failed to create data directory: {}", parent.display())
+            })?;
         }
 
         let options = SqliteConnectOptions::new()
@@ -44,17 +45,17 @@ impl Db {
             .max_connections(5)
             .connect_with(options)
             .await
-            .with_context(|| format!("打开数据库失败: {}", path.display()))?;
+            .with_context(|| format!("Failed to open database: {}", path.display()))?;
 
         sqlx::raw_sql(SCHEMA)
             .execute(&pool)
             .await
-            .context("初始化数据库表结构失败")?;
+            .context("Failed to initialize database table structure")?;
 
         Ok(Self { pool })
     }
 
-    /// 创建项目；已存在时保持幂等。
+    /// Create a project; this operation is idempotent if it already exists.
     pub async fn create_project(&self, name: &str) -> Result<(), sqlx::Error> {
         sqlx::query("INSERT OR IGNORE INTO projects (name) VALUES (?)")
             .bind(name)
@@ -71,7 +72,7 @@ impl Db {
         Ok(row.is_some())
     }
 
-    /// 写入或覆盖一个变量（value 为客户端加密后的 Base64 密文）。
+    /// Write or overwrite a variable whose value is Base64 ciphertext from the client.
     pub async fn set_secret(
         &self,
         project: &str,
@@ -108,7 +109,7 @@ impl Db {
         .await
     }
 
-    /// 列出某项目某环境下的全部变量，按变量名排序。
+    /// List all variables in a project and environment, sorted by variable name.
     pub async fn list_secrets(
         &self,
         project: &str,
@@ -127,7 +128,7 @@ impl Db {
             .collect()
     }
 
-    /// 删除一个变量，返回是否真的删掉了一行。
+    /// Delete a variable and report whether a row was deleted.
     pub async fn delete_secret(
         &self,
         project: &str,
