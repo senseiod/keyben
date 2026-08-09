@@ -1,80 +1,102 @@
 # keyben
 
-keyben is a self-hosted environment-variable and secret management tool written in Rust. It is distributed as a single binary that can run either as a storage server or as a command-line client.
+**端到端加密的环境变量与密钥管理工具。** 一个 Rust 单二进制，既能当服务端也能当客户端。加解密全部发生在你的机器上，服务器只存看不懂的密文。
 
-The client encrypts every secret before sending it to the server. The server stores and returns Base64-encoded ciphertext plus public per-project envelope metadata (an Argon2 salt, a wrapped data key, and an authentication hash), but never receives the encryption password or plaintext value.
-
-## Highlights
-
-- **End-to-end encryption:** XChaCha20-Poly1305 with associated data binding each value to its `(project, env, name)` slot, so ciphertext cannot be relocated.
-- **Argon2id key derivation** (64 MiB, memory-hard, per-project salt) instead of a bare hash.
-- **Envelope encryption:** one random data key (DEK) encrypts every value; the password only wraps that key, so a password reset re-wraps the DEK and never rewrites secret ciphertext.
-- **Two independent credentials:** a Bearer token gates the server; a per-project password gates the data.
-- **Single binary** for both server and client, backed by SQLite with no separate database service.
-- **Safe process injection:** `keyben run` passes decrypted values straight to a child process instead of writing a `.env` file.
-- **Portable:** Linux GNU and musl, macOS Apple Silicon, and Windows ARM64/x86_64 release artifacts.
-
-## How it works
-
-```text
-password ──Argon2id(salt)──▶ enc_key ──unwraps──▶ project data key (DEK)
-        │                                                  │
-        ▼                                                  ▼
-plaintext ────────────── client: XChaCha20-Poly1305 ──────┘
-        │  Base64 ciphertext over HTTP(S) + Bearer Token
-        ▼
-server: SQLite storage (salt, wrapped DEK, auth hash, ciphertext)
-        │
-        ▼
-client: download ciphertext and decrypt locally with the DEK
+```bash
+keyben run --projectName myapp --env prod -- ./server --port 8080
 ```
 
-## Security model
+> 拉取密文 → 本地解密 → 直接注入子进程环境变量。不生成 `.env` 文件，明文不落盘。
 
-keyben uses two credentials that protect different things and cannot substitute for each other.
+---
 
-| Credential | Where it lives | What it protects |
-| --- | --- | --- |
-| `auth_token` | `config.toml` on the server; `--token`/`KEYBEN_TOKEN`/`.keyben.toml` on the client | Reachability of the server. Every endpoint, including `/healthz`, returns 401 without it, so an unauthenticated party cannot even confirm which projects exist. |
-| Project password | Never stored anywhere; entered by the user | Confidentiality of the data. It derives the key that unwraps the DEK, and a separate derived value that authenticates project requests. |
+## 类型
 
-The key schedule is:
+|  |  |
+| --- | --- |
+| **形态** | 单个可执行文件，服务端与客户端二合一 |
+| **实现** | Rust（edition 2024），无运行时依赖 |
+| **存储** | SQLite 单文件，不需要独立数据库服务 |
+| **加密** | 客户端 XChaCha20-Poly1305 + Argon2id + 信封加密 |
+| **传输** | HTTP(S) + Bearer Token，可选 TLS |
+| **平台** | Linux（glibc / musl）、macOS Apple Silicon、Windows x86_64 / ARM64 |
+| **许可** | MIT |
+
+## 定位
+
+keyben 面向**自托管的个人项目和小团队**：你有几台服务器、几个项目、两套环境，想把 `.env` 从 Git 和聊天记录里挪走，但不想为此运维一套 Vault。
+
+它刻意做得很小：没有用户系统，没有 Web 界面，没有插件机制。一个二进制、一个 TOML、一个 SQLite 文件，五分钟能跑起来。
+
+### Why keyben?
+
+**服务器不需要被信任。** 密钥派生和加解密都在客户端完成。服务器拿到的是 Base64 密文，加上公开的信封元数据（Argon2 盐、被包裹的数据密钥、认证哈希）。密码从不发送，也从不存储。
+
+**两把独立的钥匙。** `auth_token` 管"能不能连上服务器"，项目密码管"能不能读懂数据"。两者不能互相替代，任何一把单独拿到都不足以读出明文。
+
+**换密码是常数时间。** 每个项目有一个随机数据密钥（DEK）加密所有值，密码只用来包裹这个 DEK。改密码只重新包裹 DEK —— 一行数据库更新，密文原封不动，不会中途损坏数据。
+
+**密文不能被搬运。** 每个值的加密都绑定了它的 `(项目, 环境, 变量名)` 槽位。把 `prod/DB_URL` 的密文复制到 `dev/OTHER` 会直接解密失败。
+
+**明文不经过磁盘。** `keyben run` 把解密后的值直接交给子进程，中间没有临时文件。
+
+### 安全边界
+
+安全的价值在于边界清楚，所以下面两份清单都写实。
+
+**keyben 保证：**
+
+- 服务器永远不接触明文和密码 —— 加解密只在客户端进行。
+- 只拿到 `auth_token` 的人能下载密文，但读不出内容。唯一出路是离线爆破 Argon2id，每次猜测要付 64 MiB 内存的代价。
+- 数据库泄露不产生可直接重放的项目凭据 —— 服务端只存 `SHA-256(auth_secret)`。
+- 密文不能跨槽位搬运（AAD 绑定 `项目/环境/变量名`）。
+- 重置密码不重写任何密文，因此不存在"改到一半坏掉"的状态。
+
+**keyben 不保证：**
+
+- **弱密码的安全。** Argon2id 和每项目独立的盐让每次猜测变贵、消除彩虹表和跨项目密钥复用，但短密码或常见密码照样会被爆破。请用长的随机密码。
+- **内存中不残留密钥。** 派生密钥、DEK 和密码字符串目前没有显式清零，core dump 或交换分区可能留下痕迹（release 配置使用 `panic = "abort"`，这会略微放大该风险）。
+- **服务端的可用性与完整性。** 服务器读不懂数据，但可以删除、替换或拒绝返回密文。请自行备份与监控。
+- **身份与审计。** 没有用户、角色、权限分级、token 轮换或审计日志 —— token 是一把全局钥匙。
+- **默认的传输安全。** 不配置 `cert` / `key` 时服务器讲明文 HTTP，此时项目认证头可被同网络的人重放。仅限可信内网（例如 Tailscale）这样用。
+- **文件权限收紧。** `.keyben.toml` 按系统默认权限写入（通常 `0644`），keyben 不额外处理。
+- **命令行传值的隐蔽性。** `--value` / `--password` 会进入 shell 历史和进程列表，优先用交互式输入。
+- **企业级能力。** 没有密钥版本化、自动轮换、高可用或远程备份；环境固定为 `dev` 和 `prod` 两个。
+
+### 工作原理
+
+```text
+密码 ──Argon2id(盐)──▶ enc_key ──解包──▶ 项目数据密钥 (DEK)
+     │                                          │
+     ▼                                          ▼
+ 明文 ──────── 客户端：XChaCha20-Poly1305 ──────┘
+     │  Base64 密文 over HTTP(S) + Bearer Token
+     ▼
+ 服务端：SQLite（盐、被包裹的 DEK、认证哈希、密文）
+     │
+     ▼
+ 客户端：下载密文，用 DEK 在本地解密
+```
+
+密钥编排：
 
 ```text
 master_key  = Argon2id(password, project_salt, m=64MiB, t=3, p=4)
-enc_key     = HKDF-SHA256(master_key, "keyben v1 kek")    # wraps the DEK, client only
-auth_secret = HKDF-SHA256(master_key, "keyben v1 auth")   # sent to the server
+enc_key     = HKDF-SHA256(master_key, "keyben v1 kek")    # 包裹 DEK，仅客户端持有
+auth_secret = HKDF-SHA256(master_key, "keyben v1 auth")   # 发给服务端做项目认证
 ```
 
-The server stores `SHA-256(auth_secret)`, so even a full database leak yields no replayable credential. The two subkeys are domain-separated, so the value the server sees reveals nothing about the encryption key.
+两个子密钥做了域分离，所以服务端看到的 `auth_secret` 不泄露任何关于加密密钥的信息。
 
-An attacker holding only the token can download ciphertext but cannot read it: values are encrypted with the DEK, the DEK is wrapped by `enc_key`, and the password never leaves the client. Their only path forward is an offline attack against Argon2id, paying 64 MiB of memory per guess. An attacker holding only the password cannot reach the server at all.
+---
 
-## Advantages
+## 安装
 
-- **Simple deployment:** one executable and one TOML file; no separate database service is required.
-- **Small attack surface:** the server exposes only project and secret CRUD endpoints and implements no user accounts or browser UI.
-- **Cheap password rotation:** re-keying touches one database row, so it cannot partially corrupt data.
-- **Portable:** official release archives cover common Linux, musl, macOS ARM64, and Windows targets.
+### 下载预编译二进制
 
-## Limitations and trade-offs
+从 [GitHub Releases](https://github.com/senseiod/keyben/releases) 下载对应平台的压缩包。
 
-- **The password is still the weakest link.** Argon2id makes each guess expensive and the per-project salt prevents rainbow tables and cross-project key reuse, but neither makes a short or common password safe. Use a long, randomly generated one.
-- **The token is not an identity system.** There are no users, roles, token rotation, or audit logs.
-- **The server is not trusted for availability or integrity.** It can delete, replace, or withhold ciphertext even though it cannot decrypt it. Use backups and monitoring.
-- **TLS is optional.** Without `cert` and `key`, the server speaks plaintext HTTP. Only use that on a trusted private network such as Tailscale.
-- **Command-line values can leak.** Anything passed via `--value`, `--password`, or an environment variable may appear in shell history, process listings, or CI logs. Prefer the interactive prompt and a protected automation secret store.
-- **Environments are limited to `dev` and `prod`,** and there is no secret versioning, rotation workflow, high availability, or remote backup.
-
-keyben is a good fit for a small self-hosted deployment or an internal network. It is not a full enterprise KMS, IAM system, or multi-tenant secrets platform.
-
-## Installation
-
-### Install a release binary
-
-Download the archive for your platform from the [GitHub Releases](https://github.com/senseiod/keyben/releases) page, extract it, and place the `keyben` executable on your `PATH`.
-
-On Linux or macOS:
+**Linux / macOS**
 
 ```bash
 tar -xzf keyben-linux-x86_64.tar.gz
@@ -82,19 +104,31 @@ sudo install -m 0755 keyben-linux-x86_64/keyben /usr/local/bin/keyben
 keyben --version
 ```
 
-Substitute the archive name matching your CPU and libc variant. The `linux-musl-*` archives are intended for musl-based systems such as Alpine Linux.
-
-On Windows, extract the `windows-x86_64` or `windows-arm64` archive and add its directory to `PATH`. For example, in PowerShell:
+**Windows**（PowerShell）
 
 ```powershell
 tar -xzf .\keyben-windows-x86_64.tar.gz
 ```
 
-The official release archives use `.tar.gz` for all platforms; Windows also includes the `keyben.exe` executable inside the archive.
+解压后把目录加入 `PATH`。所有平台的发布包都是 `.tar.gz`，Windows 包内含 `keyben.exe`。
 
-### Build from source
+可用的包名：
 
-Install the current stable Rust toolchain, then run:
+| 包名 | 目标平台 |
+| --- | --- |
+| `keyben-linux-x86_64` | Linux x86_64（glibc） |
+| `keyben-linux-arm64` | Linux ARM64（glibc） |
+| `keyben-linux-musl-x86_64` | Linux x86_64（musl，如 Alpine） |
+| `keyben-linux-musl-arm64` | Linux ARM64（musl） |
+| `keyben-macos-arm64` | macOS Apple Silicon |
+| `keyben-windows-x86_64` | Windows x86_64 |
+| `keyben-windows-arm64` | Windows ARM64 |
+
+每个 Release 同时发布 `SHA256SUMS` 用于校验。
+
+### 从源码构建
+
+需要当前 stable Rust 工具链：
 
 ```bash
 git clone https://github.com/senseiod/keyben.git
@@ -102,227 +136,226 @@ cd keyben
 cargo build --locked --release
 ```
 
-The compiled binary is located at `target/release/keyben`. You can also install it with:
+产物在 `target/release/keyben`。也可以直接安装：
 
 ```bash
 cargo install --path . --locked
 ```
 
-## Server setup
+---
 
-### Configuration file
+## 服务端
 
-Create `/etc/keyben/config.toml`:
+### 配置
+
+创建 `/etc/keyben/config.toml`：
 
 ```toml
 [server]
 
-# Address and port to bind.
+# 监听地址和端口
 listen = "0.0.0.0:8000"
 
-# SQLite file. Parent directories are created automatically.
+# SQLite 文件，父目录会自动创建
 data = "/var/lib/keyben/keyben.db"
 
-# Required HTTP API authentication token.
+# HTTP API 认证 token（必填，不能为空）
 auth_token = "replace-with-a-long-random-token"
 
-# Configure both fields to enable HTTPS. Leave both out to use HTTP.
+# 两个都配置才启用 HTTPS；都省略则使用 HTTP
 # cert = "/etc/keyben/server.crt"
-# key = "/etc/keyben/server.key"
+# key  = "/etc/keyben/server.key"
 ```
 
-Generate a token with a local tool instead of using a short human-readable value:
+| 字段 | 必填 | 说明 |
+| --- | :---: | --- |
+| `listen` | ✓ | 监听地址，如 `0.0.0.0:8000` |
+| `data` | ✓ | SQLite 文件路径，父目录自动创建 |
+| `auth_token` | ✓ | Bearer Token；为空则拒绝启动 |
+| `cert` / `key` | — | TLS 证书与私钥（PEM）。**必须成对出现**，只配一个会拒绝启动 |
+
+用工具生成 token，别用能读出来的短字符串：
 
 ```bash
 openssl rand -hex 32
 ```
 
-`auth_token` must not be empty. `cert` and `key` must either both be configured or both omitted. The server refuses to start if only one TLS file is present.
+### 启动
 
-### Start the server
-
-The same executable starts the server when `--config` or `-c` is supplied:
+同一个可执行文件，带 `-c` / `--config` 就是服务端：
 
 ```bash
 keyben --config /etc/keyben/config.toml
 ```
 
-For a foreground service with logs:
+带日志的前台运行：
 
 ```bash
-RUST_LOG=keyben=info,tower_http=info \
-  keyben -c /etc/keyben/config.toml
+RUST_LOG=keyben=info,tower_http=info keyben -c /etc/keyben/config.toml
 ```
 
-The server logs its HTTP or HTTPS address and the database path. Press `Ctrl-C` for a graceful shutdown. Do not combine `--config` with a client subcommand.
+启动后会打印 HTTP/HTTPS 地址和数据库路径，`Ctrl-C` 优雅退出。不要把 `--config` 和客户端子命令混用。
 
-The health endpoint is protected by the same Bearer Token as every other endpoint:
+> **注意：** `tower_http=debug` 会把请求路径写进日志，其中包含变量名（但不含值）。生产环境建议保持 `info`。
+
+### 健康检查
+
+`/healthz` 和其他端点一样在 Bearer Token 之后 —— 未认证的人连"有哪些项目存在"都探测不到，因此监控探针也需要带上 token：
 
 ```bash
-curl --fail \
-  -H "Authorization: Bearer ${KEYBEN_TOKEN}" \
-  http://127.0.0.1:8000/healthz
+curl --fail -H "Authorization: Bearer ${KEYBEN_TOKEN}" http://127.0.0.1:8000/healthz
 ```
 
-When using a self-signed certificate during internal testing, the client can skip certificate verification with `--insecure`. Do not use that option on an untrusted network.
+### 备份与恢复
 
-## Client configuration
+数据库里是每项目的信封元数据（Argon2 盐、被包裹的 DEK、认证哈希）和加密后的值。**定期备份这个 SQLite 文件**，连同运行所需的配置。
 
-The client needs the server URL and API token. They can be supplied globally on each command or through environment variables:
+恢复不需要重新加密：还原 SQLite 文件、用兼容配置启动服务端、客户端继续用原来的项目密码即可。
+
+> 密码不由 keyben 保存，也无法由服务端找回。密码丢失 = 被包裹的 DEK 无法解开 = 该项目所有密文永久不可读。
+
+---
+
+## 客户端
+
+### 五分钟上手
 
 ```bash
+# 1. 告诉客户端服务器在哪
 export KEYBEN_SERVER="https://secrets.example.com"
-export KEYBEN_TOKEN="replace-with-the-server-auth-token"
-```
+export KEYBEN_TOKEN="服务端 config.toml 里的 auth_token"
 
-For a project-local setup, create an encrypted `.keyben.toml` file:
-
-```bash
-keyben config init \
-  --projectName frontierkings \
-  --server http://example.com \
-  --token 123456
-```
-
-Any omitted value is requested interactively. The command encrypts the server URL and token under the **project password** before writing the file, so there is only one password to remember. The project name stays in plaintext so it can serve as the default project identifier. If `.keyben.toml` already exists, keyben asks before overwriting it.
-
-When a client command runs in the directory containing `.keyben.toml`, keyben asks for the project password once and uses it both to decrypt the file and to unlock the project. Explicit command-line values take precedence, followed by `KEYBEN_SERVER`/`KEYBEN_TOKEN`, and then the project-local file. Use `--password` or `KEYBEN_PASSWORD` for non-interactive use.
-
-The file is encrypted with its own Argon2id salt, so its key is independent of the project master key even though both derive from the same password. It holds no key material: the project data key stays wrapped on the server, so someone who cracks this file gains the token's reach but still cannot decrypt any secret. keyben does not assign it special filesystem permissions; do not commit it unless that is intentional.
-
-`keyben password reset` changes the project password on the server but does not rewrite `.keyben.toml`. Recreate the file with `keyben config init` afterwards, as the command's output reminds you.
-
-Each project has one password. During `init`, keyben asks for the password twice, derives the project keys locally with Argon2id, and sends the server only public envelope metadata (salt, wrapped data key, and an authentication hash). The password itself is never sent to or stored by the server. If `--password` or `KEYBEN_PASSWORD` is not provided for `secrets` or `run`, keyben prompts for it interactively without echoing it:
-
-```bash
-keyben secrets get --projectName myapp --env prod --name DB_URL
-```
-
-For automation, set `KEYBEN_PASSWORD` through the CI system's protected secret mechanism. Avoid committing passwords, tokens, or plaintext values to shell scripts or repository files.
-
-## Common client commands
-
-All commands below assume `KEYBEN_SERVER` and `KEYBEN_TOKEN` are set. A project must exist before secrets can be written.
-
-### Create a project
-
-```bash
+# 2. 创建项目（此时设置项目密码，会要求输入两次）
 keyben init --projectName myapp
+
+# 3. 写入一个密钥
+keyben secrets set --projectName myapp --env dev \
+  --name DB_URL --value 'postgres://user:pw@db.example.com/app'
+
+# 4. 读回来
+keyben secrets get --projectName myapp --env dev --name DB_URL
+
+# 5. 直接跑你的服务
+keyben run --projectName myapp --env dev -- ./server --port 8080
 ```
 
-Project creation is exclusive: once a project name is taken, `init` for that name is rejected. Existing secrets are never touched.
+`init` 时 keyben 在本地用 Argon2id 派生项目密钥，只把公开的信封元数据发给服务端。密码本身永远不会离开你的机器。
 
-Project names are trimmed of surrounding whitespace on every path, so `myapp` and `' myapp '` refer to the same project rather than silently diverging.
+### 命令一览
 
-### Reset a project password
+| 命令 | 作用 |
+| --- | --- |
+| `keyben init` | 在服务端创建项目并设置密码 |
+| `keyben config init` | 生成项目本地的加密配置文件 `.keyben.toml` |
+| `keyben secrets set` | 加密并写入一个变量 |
+| `keyben secrets get` | 读取并解密一个变量，或整个环境 |
+| `keyben secrets delete` | 删除一个变量 |
+| `keyben password reset` | 更换项目密码（密文不动） |
+| `keyben run -- <cmd>` | 注入解密后的环境变量并启动子进程 |
+
+全局选项：`--server` / `--token` / `--password` / `--insecure`，分别对应环境变量 `KEYBEN_SERVER`、`KEYBEN_TOKEN`、`KEYBEN_PASSWORD`、`KEYBEN_INSECURE`。
+
+### 项目本地配置
+
+不想每次都导出环境变量，可以在项目目录生成一个加密的 `.keyben.toml`：
 
 ```bash
-keyben password reset \
-  --projectName myapp \
-  --password 'current-password' \
-  --new-password 'new-password'
+keyben config init --projectName myapp --server https://secrets.example.com --token <TOKEN>
 ```
 
-When either password option is omitted, keyben prompts securely. Because secrets are encrypted with a per-project data key rather than the password directly, the reset only re-derives keys and re-wraps that same data key under the new password — the stored secret ciphertext is left untouched, so the operation is fast and cannot partially corrupt data. An incorrect current password is rejected by the server. For automation, the new password can also be provided through `KEYBEN_NEW_PASSWORD`. Any `.keyben.toml` in the working directory keeps its old password until you recreate it with `keyben config init`.
+省略的值会交互式询问。服务器地址和 token 用**项目密码**加密后写入 —— 只需要记一个密码。项目名保持明文，作为默认的项目标识。文件已存在时会先询问是否覆盖。
 
-### Set or overwrite a secret
+之后在该目录下运行任何命令，keyben 问一次项目密码，同时用它解密配置文件和解锁项目。取值优先级：
+
+```text
+命令行参数  >  KEYBEN_SERVER / KEYBEN_TOKEN  >  .keyben.toml
+```
+
+自动化场景用 `--password` 或 `KEYBEN_PASSWORD` 免交互。
+
+> **这个文件里没有密钥材料。** 它用独立的 Argon2id 盐加密，密钥与项目主密钥无关；项目 DEK 始终包裹在服务端。破解这个文件的人得到的是 token 的可达范围，仍然解不开任何密钥。keyben 不会为它设置特殊的文件权限 —— 除非有意为之，否则不要提交进版本库。
+
+### 管理密钥
+
+**写入 / 覆盖**
 
 ```bash
-keyben secrets set \
-  --projectName myapp \
-  --env dev \
-  --name DB_URL \
-  --value 'postgres://user:password@db.example.com/app'
+keyben secrets set --projectName myapp --env dev \
+  --name DB_URL --value 'postgres://user:pw@db.example.com/app'
 ```
 
-The value is encrypted locally before the HTTP request is sent. The project password is checked by the server before the ciphertext is stored. `--env` accepts `dev` or `prod`.
+值在本地加密后才发出。`--env` 接受 `dev` 或 `prod`。
 
-Both `--name` and `--value` are optional in an interactive terminal. When omitted, keyben prompts for the variable name and reads the value without echoing it:
+在交互式终端里 `--name` 和 `--value` 都可以省略，keyben 会提示输入变量名，并以不回显的方式读取值 —— **推荐用这种方式**，避免明文进入 shell 历史：
 
 ```bash
 keyben secrets set --projectName myapp --env dev
 ```
 
-### Read one secret
+**读取单个**
 
 ```bash
-keyben secrets get \
-  --projectName myapp \
-  --env dev \
-  --name DB_URL
+keyben secrets get --projectName myapp --env dev --name DB_URL
 ```
 
-The decrypted plaintext is printed to standard output.
+解密后的明文打印到标准输出。
 
-### Read every secret in an environment
+**读取整个环境**
 
 ```bash
-keyben secrets get \
-  --projectName myapp \
-  --env dev
+keyben secrets get --projectName myapp --env dev
 ```
 
-Output uses `KEY=VALUE` form and is sorted by variable name. Values containing newline characters naturally span multiple output lines.
+按变量名排序，以 `KEY=VALUE` 的形式输出。含换行的值自然会跨多行。
 
-### Delete a secret
+**删除**
 
 ```bash
-keyben secrets delete \
-  --projectName myapp \
-  --env dev \
-  --name DB_URL
+keyben secrets delete --projectName myapp --env dev --name DB_URL
 ```
 
-### Run a command with decrypted environment variables
+### 运行子进程
 
 ```bash
-keyben run \
-  --projectName myapp \
-  --env prod \
-  -- ./server --port 8080
+keyben run --projectName myapp --env prod -- ./server --port 8080
 ```
 
-Everything after `--` is treated as the child command and its arguments. keyben fetches and decrypts the environment, starts the child process, and propagates its exit code.
+`--` 之后的一切都是子命令及其参数。keyben 拉取并解密整个环境，启动子进程，并透传它的退出码。
 
-The child inherits the caller's environment plus the decrypted secrets, minus keyben's own credentials: `KEYBEN_TOKEN`, `KEYBEN_PASSWORD`, `KEYBEN_NEW_PASSWORD`, and `KEYBEN_CONFIG_PASSWORD` are removed so a child that dumps its environment cannot expose them. A secret stored under one of those names still takes effect — an explicit value wins over the ambient one.
+子进程继承调用者的环境，加上解密出的密钥，**减去 keyben 自己的凭据** —— `KEYBEN_TOKEN`、`KEYBEN_PASSWORD`、`KEYBEN_NEW_PASSWORD`、`KEYBEN_CONFIG_PASSWORD` 会被移除，避免一个打印环境变量的子进程把它们暴露出去。如果项目里确实存了同名的密钥，显式值优先，仍然会生效。
 
-### Use a self-signed internal HTTPS certificate
+### 更换项目密码
 
 ```bash
-keyben --insecure secrets get \
-  --projectName myapp \
-  --env dev \
-  --name DB_URL
+keyben password reset --projectName myapp \
+  --password 'current-password' --new-password 'new-password'
 ```
 
-Use `--insecure` only when the certificate is self-signed and the connection is otherwise controlled. Prefer installing a trusted CA certificate for production use.
+任一密码省略时会安全提示输入。因为值是用每项目的 DEK 加密而非直接用密码，重置只是重新派生密钥并用新密码重新包裹**同一个 DEK** —— 存储的密文完全不动，所以又快又不会产生半损坏状态。当前密码不正确会被服务端拒绝。自动化可以用 `KEYBEN_NEW_PASSWORD` 传入新密码。
 
-## Data and recovery
+> 工作目录下的 `.keyben.toml` 仍然停留在旧密码上，重置后用 `keyben config init` 重新生成。
 
-The server database contains per-project envelope metadata (Argon2 salt, wrapped data key, authentication hash) and encrypted secret values. Back up the SQLite file regularly, along with the server configuration needed to operate it. The encryption password is not stored by keyben and cannot be recovered by the server; losing it makes the wrapped data key — and therefore all ciphertext for that project — unreadable.
+### 自签名证书
 
-Restoring a database does not require re-encrypting secrets. Restore the SQLite file, start the server with a compatible configuration, and use the original encryption password from the client.
+```bash
+keyben --insecure secrets get --projectName myapp --env dev --name DB_URL
+```
 
-### Storage format
+`--insecure` 跳过 TLS 证书校验，只在证书自签且链路本身可控时使用。生产环境请安装受信任的 CA 证书。
 
-The current format is v2 (Argon2id key derivation and envelope encryption). It is not backward compatible with databases or `.keyben.toml` files written by v0.1.x, and no migration path is provided: start the server on a fresh database path, re-run `keyben init` per project, re-enter the secrets, and recreate any project-local file with `keyben config init`.
+### 一些约定
 
-## Releases
+- **项目名在所有路径上都会去除首尾空格**，`myapp` 和 `' myapp '` 指向同一个项目，不会静默分叉。
+- **项目创建是排他的**：名字一旦被占用，再次 `init` 会被拒绝，已有密钥不受影响。
+- **环境固定为 `dev` 和 `prod`**。
+- CI 场景请通过 CI 自身的受保护密钥机制注入 `KEYBEN_PASSWORD`，不要把密码、token 或明文值写进脚本或仓库文件。
 
-Pushing a tag matching `v*` runs the GitHub Actions release pipeline. Each release contains packaged, release-mode binaries for the following targets:
+---
 
-| Artifact | Rust target | Runtime |
-| --- | --- | --- |
-| `linux-x86_64` | `x86_64-unknown-linux-gnu` | Linux x86_64, glibc-based Unix-compatible systems |
-| `linux-arm64` | `aarch64-unknown-linux-gnu` | Linux ARM64, glibc-based Unix-compatible systems |
-| `macos-arm64` | `aarch64-apple-darwin` | macOS Apple Silicon |
-| `windows-arm64` | `aarch64-pc-windows-msvc` | Windows ARM64 |
-| `windows-x86_64` | `x86_64-pc-windows-msvc` | Windows x86_64 |
-| `linux-musl-x86_64` | `x86_64-unknown-linux-musl` | Linux x86_64 with musl |
-| `linux-musl-arm64` | `aarch64-unknown-linux-musl` | Linux ARM64 with musl |
+## 存储格式
 
-Every archive includes the `keyben` binary, this README, and the MIT license. The release also publishes a `SHA256SUMS` file for artifact verification.
+当前格式为 **v2**（Argon2id 密钥派生 + 信封加密），与 v0.1.x 写入的数据库和 `.keyben.toml` **不兼容**，且不提供迁移路径。升级方式：换一个全新的数据库路径启动服务端，逐个项目重新 `keyben init`，重新录入密钥，并用 `keyben config init` 重建项目本地配置文件。
 
 ## License
 
-keyben is released under the [MIT License](LICENSE).
+keyben 基于 [MIT License](LICENSE) 发布。
