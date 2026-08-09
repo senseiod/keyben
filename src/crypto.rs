@@ -33,23 +33,6 @@ const NONCE_LEN: usize = 24;
 /// Poly1305 authentication tag length in bytes.
 const TAG_LEN: usize = 16;
 
-/// Argon2id memory cost in KiB (64 MiB).
-const ARGON2_M_COST_KIB: u32 = 64 * 1024;
-/// Argon2id time cost (iterations).
-const ARGON2_T_COST: u32 = 3;
-/// Argon2id parallelism (lanes).
-const ARGON2_P_COST: u32 = 4;
-
-/// HKDF domain-separation label for the DEK-wrapping key.
-const HKDF_ENC_INFO: &[u8] = b"keyben v1 kek";
-/// HKDF domain-separation label for the server authentication secret.
-const HKDF_AUTH_INFO: &[u8] = b"keyben v1 auth";
-
-/// Associated-data suffix for the wrapped DEK.
-const WRAP_AAD_SUFFIX: &[u8] = b"wrap-v1";
-/// Associated-data suffix for a secret value.
-const SECRET_AAD_SUFFIX: &[u8] = b"secret-v1";
-
 /// Generate a random Argon2 salt for a new project or configuration file.
 pub fn generate_salt() -> [u8; SALT_LEN] {
     rand::random()
@@ -83,9 +66,10 @@ impl ProjectKeys {
 /// Derive the per-project subkeys from the password and its salt.
 pub fn derive_project_keys(password: &str, salt: &[u8]) -> Result<ProjectKeys> {
     let master_key = argon2id_key(password, salt)?;
+    // The two info labels domain-separate the subkeys: neither reveals the other.
     Ok(ProjectKeys {
-        enc_key: hkdf_subkey(&master_key, HKDF_ENC_INFO),
-        auth_secret: hkdf_subkey(&master_key, HKDF_AUTH_INFO),
+        enc_key: hkdf_subkey(&master_key, b"keyben v1 kek"),
+        auth_secret: hkdf_subkey(&master_key, b"keyben v1 auth"),
     })
 }
 
@@ -93,13 +77,9 @@ pub fn derive_project_keys(password: &str, salt: &[u8]) -> Result<ProjectKeys> {
 ///
 /// Used directly for the local configuration file, and internally as the project master key.
 pub fn argon2id_key(password: &str, salt: &[u8]) -> Result<[u8; KEY_LEN]> {
-    let params = Params::new(
-        ARGON2_M_COST_KIB,
-        ARGON2_T_COST,
-        ARGON2_P_COST,
-        Some(KEY_LEN),
-    )
-    .map_err(|err| anyhow!("Invalid Argon2 parameters: {err}"))?;
+    // m = 64 MiB, t = 3 iterations, p = 4 lanes.
+    let params = Params::new(64 * 1024, 3, 4, Some(KEY_LEN))
+        .map_err(|err| anyhow!("Invalid Argon2 parameters: {err}"))?;
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
     let mut key = [0u8; KEY_LEN];
     argon2
@@ -121,7 +101,7 @@ fn hkdf_subkey(master_key: &[u8; KEY_LEN], info: &[u8]) -> [u8; KEY_LEN] {
 
 /// Build the associated data for a wrapped DEK: `project || 0x00 || "wrap-v1"`.
 fn wrap_aad(project: &str) -> Vec<u8> {
-    aad(&[project.as_bytes(), WRAP_AAD_SUFFIX])
+    aad(&[project.as_bytes(), b"wrap-v1"])
 }
 
 /// Build the associated data for a secret: `project || 0x00 || env || 0x00 || name || 0x00 || "secret-v1"`.
@@ -130,7 +110,7 @@ fn secret_aad(project: &str, env: &str, name: &str) -> Vec<u8> {
         project.as_bytes(),
         env.as_bytes(),
         name.as_bytes(),
-        SECRET_AAD_SUFFIX,
+        b"secret-v1",
     ])
 }
 

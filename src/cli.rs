@@ -15,7 +15,7 @@ use std::path::PathBuf;
     long_about = "keyben — an end-to-end encrypted environment variable manager.\n\n\
                   Server mode: keyben -c /etc/keyben/config.toml\n\
                   Client mode: keyben init | keyben secrets ... | keyben password ... | keyben run ...\n\n\
-                  All encryption and decryption happen on the client (ChaCha20-Poly1305); the server stores only Base64 ciphertext.",
+                  All encryption and decryption happen on the client (XChaCha20-Poly1305); the server stores only Base64 ciphertext.",
     after_help = "Examples:\n  \
         keyben -c config.toml\n  \
         keyben --server http://127.0.0.1:8000 init --projectName myapp\n  \
@@ -43,16 +43,7 @@ pub struct Cli {
     )]
     pub token: Option<String>,
 
-    /// Password used to decrypt `.keyben.toml`; prompts securely when needed.
-    #[arg(
-        long = "config-password",
-        env = "KEYBEN_CONFIG_PASSWORD",
-        value_name = "PASSWORD",
-        hide_env_values = true
-    )]
-    pub config_password: Option<String>,
-
-    /// Project password; prompts securely when omitted.
+    /// Project password; also decrypts `.keyben.toml`. Prompts securely when omitted.
     #[arg(
         long,
         global = true,
@@ -191,7 +182,7 @@ pub enum ConfigCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum PasswordCommand {
-    /// Re-encrypt every secret and replace the project's password.
+    /// Re-wrap the project data key under a new password; secrets are left untouched.
     Reset {
         /// Project name.
         #[arg(long = "projectName", value_name = "NAME")]

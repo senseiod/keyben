@@ -88,7 +88,7 @@ fn router(db: Db, auth_token: &str) -> Router {
             "/api/project-passwords/{project}",
             post(reset_project_password),
         )
-        .route("/api/projects/{project}/meta", get(get_project_meta))
+        .route("/api/project-meta/{project}", get(get_project_meta))
         .route("/api/projects/{project}/{env}", get(list_secrets))
         .route(
             "/api/projects/{project}/{env}/{name}",
@@ -177,13 +177,6 @@ struct ResetProjectPassword {
 
 const PROJECT_AUTH_HEADER: &str = "x-keyben-project-auth";
 
-/// Decoded byte length of the public Argon2 salt.
-const SALT_BYTES: usize = 16;
-/// Decoded byte length of the stored auth hash (SHA-256 output).
-const AUTH_HASH_BYTES: usize = 32;
-/// Minimum decoded length of a wrapped DEK: 24-byte nonce + 32-byte key + 16-byte tag.
-const MIN_WRAPPED_DEK_BYTES: usize = 24 + 32 + 16;
-
 /// The value is always Base64 ciphertext encrypted by the client.
 #[derive(Debug, Deserialize, Serialize)]
 struct SecretValue {
@@ -209,10 +202,7 @@ async fn create_project(
     State(db): State<Db>,
     Json(body): Json<CreateProject>,
 ) -> Result<StatusCode, ApiError> {
-    let name = body.name.trim();
-    if name.is_empty() {
-        return Err(ApiError::bad_request("Project name cannot be empty"));
-    }
+    let name = canonical_project(&body.name)?;
     validate_envelope_fields(&body.salt, &body.wrapped_dek, &body.auth_hash)?;
 
     if db
@@ -236,10 +226,8 @@ async fn get_project_meta(
     State(db): State<Db>,
     AxumPath(project): AxumPath<String>,
 ) -> Result<Json<ProjectMetaResponse>, ApiError> {
-    if project.trim().is_empty() {
-        return Err(ApiError::bad_request("Project name cannot be empty"));
-    }
-    match db.project_meta(&project).await? {
+    let project = canonical_project(&project)?;
+    match db.project_meta(project).await? {
         Some(ProjectMeta { salt, wrapped_dek }) => {
             Ok(Json(ProjectMetaResponse { salt, wrapped_dek }))
         }
@@ -255,16 +243,14 @@ async fn reset_project_password(
     headers: HeaderMap,
     Json(body): Json<ResetProjectPassword>,
 ) -> Result<StatusCode, ApiError> {
-    if project.trim().is_empty() {
-        return Err(ApiError::bad_request("Project name cannot be empty"));
-    }
+    let project = canonical_project(&project)?;
     validate_envelope_fields(&body.salt, &body.wrapped_dek, &body.auth_hash)?;
 
-    let old_auth_hash = authorize_project(&db, &project, &headers).await?;
+    let old_auth_hash = authorize_project(&db, project, &headers).await?;
 
     match db
         .reset_password(
-            &project,
+            project,
             &old_auth_hash,
             body.salt.trim(),
             body.wrapped_dek.trim(),
@@ -285,12 +271,13 @@ fn validate_envelope_fields(
     wrapped_dek: &str,
     auth_hash: &str,
 ) -> Result<(), ApiError> {
-    decode_exact(salt, SALT_BYTES, "project salt")?;
-    decode_exact(auth_hash, AUTH_HASH_BYTES, "auth hash")?;
+    decode_exact(salt, 16, "project salt")?;
+    decode_exact(auth_hash, 32, "auth hash")?;
+    // A wrapped DEK is at least a 24-byte nonce, a 32-byte key, and a 16-byte tag.
     let dek = B64
         .decode(wrapped_dek.trim())
         .map_err(|_| ApiError::bad_request("Wrapped DEK must be valid Base64"))?;
-    if dek.len() < MIN_WRAPPED_DEK_BYTES {
+    if dek.len() < 24 + 32 + 16 {
         return Err(ApiError::bad_request(
             "Wrapped DEK is too short to be valid",
         ));
@@ -316,11 +303,11 @@ async fn set_secret(
     headers: HeaderMap,
     Json(body): Json<SecretValue>,
 ) -> Result<StatusCode, ApiError> {
-    validate_project_and_env(&project, &env, Some(&name))?;
-    let password_hash = authorize_project(&db, &project, &headers).await?;
+    let project = validate_project_and_env(&project, &env, Some(&name))?;
+    let password_hash = authorize_project(&db, project, &headers).await?;
 
     if db
-        .set_secret_if_password_matches(&project, &env, &name, &body.value, &password_hash)
+        .set_secret_if_password_matches(project, &env, &name, &body.value, &password_hash)
         .await?
     {
         Ok(StatusCode::NO_CONTENT)
@@ -336,9 +323,9 @@ async fn get_secret(
     AxumPath((project, env, name)): AxumPath<(String, String, String)>,
     headers: HeaderMap,
 ) -> Result<Json<SecretValue>, ApiError> {
-    validate_project_and_env(&project, &env, Some(&name))?;
-    let _password_hash = authorize_project(&db, &project, &headers).await?;
-    match db.get_secret(&project, &env, &name).await? {
+    let project = validate_project_and_env(&project, &env, Some(&name))?;
+    let _password_hash = authorize_project(&db, project, &headers).await?;
+    match db.get_secret(project, &env, &name).await? {
         Some(value) => Ok(Json(SecretValue { value })),
         None => Err(ApiError::not_found(format!(
             "Secret `{name}` does not exist in {project}/{env}"
@@ -351,11 +338,11 @@ async fn list_secrets(
     AxumPath((project, env)): AxumPath<(String, String)>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<SecretEntry>>, ApiError> {
-    validate_project_and_env(&project, &env, None)?;
-    let _password_hash = authorize_project(&db, &project, &headers).await?;
+    let project = validate_project_and_env(&project, &env, None)?;
+    let _password_hash = authorize_project(&db, project, &headers).await?;
 
     let secrets = db
-        .list_secrets(&project, &env)
+        .list_secrets(project, &env)
         .await?
         .into_iter()
         .map(|(name, value)| SecretEntry { name, value })
@@ -369,15 +356,15 @@ async fn delete_secret(
     AxumPath((project, env, name)): AxumPath<(String, String, String)>,
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
-    validate_project_and_env(&project, &env, Some(&name))?;
-    let password_hash = authorize_project(&db, &project, &headers).await?;
+    let project = validate_project_and_env(&project, &env, Some(&name))?;
+    let password_hash = authorize_project(&db, project, &headers).await?;
     if db
-        .delete_secret_if_password_matches(&project, &env, &name, &password_hash)
+        .delete_secret_if_password_matches(project, &env, &name, &password_hash)
         .await?
     {
         Ok(StatusCode::NO_CONTENT)
     } else {
-        authorize_project(&db, &project, &headers).await?;
+        authorize_project(&db, project, &headers).await?;
         Err(ApiError::not_found(format!(
             "Secret `{name}` does not exist in {project}/{env}"
         )))
@@ -411,10 +398,22 @@ async fn authorize_project(
     }
 }
 
-fn validate_project_and_env(project: &str, env: &str, name: Option<&str>) -> Result<(), ApiError> {
-    if project.trim().is_empty() {
+/// Canonicalize a project name. `create_project` stores the trimmed form, so every lookup
+/// must trim identically or it would miss the row it just created.
+fn canonical_project(project: &str) -> Result<&str, ApiError> {
+    let project = project.trim();
+    if project.is_empty() {
         return Err(ApiError::bad_request("Project name cannot be empty"));
     }
+    Ok(project)
+}
+
+fn validate_project_and_env<'a>(
+    project: &'a str,
+    env: &str,
+    name: Option<&str>,
+) -> Result<&'a str, ApiError> {
+    let project = canonical_project(project)?;
     if !matches!(env, "dev" | "prod") {
         return Err(ApiError::bad_request("Environment must be 'dev' or 'prod'"));
     }
@@ -423,7 +422,7 @@ fn validate_project_and_env(project: &str, env: &str, name: Option<&str>) -> Res
     {
         return Err(ApiError::bad_request("Secret name cannot be empty"));
     }
-    Ok(())
+    Ok(project)
 }
 
 // --------------------------------------------------------------------- Errors
@@ -491,6 +490,156 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(PROJECT_AUTH_HEADER, keys.auth_secret_b64().parse().unwrap());
         headers
+    }
+
+    /// Project metadata lives under its own prefix so no path can match two routes. This drives
+    /// the real `router()` — including its Bearer layer — rather than a copy of the route list.
+    #[tokio::test]
+    async fn routes_dispatch_without_overlap() {
+        use tower::ServiceExt;
+
+        let path = std::env::temp_dir().join(format!("keyben-route-{}.db", rand::random::<u64>()));
+        let db = Db::open(&path).await.unwrap();
+
+        // Two projects whose names collide with the path segments used by other routes.
+        for name in ["meta", "app"] {
+            let salt = crypto::generate_salt();
+            let keys = crypto::derive_project_keys("pw", &salt).unwrap();
+            let dek = crypto::generate_dek();
+            db.create_project(
+                name,
+                &B64.encode(salt),
+                &crypto::wrap_dek(&keys, &dek, name).unwrap(),
+                &keys.auth_hash_b64(),
+            )
+            .await
+            .unwrap();
+        }
+
+        let call = |uri: &str, token: Option<&str>| {
+            // Router::route panics on a conflicting table, so building it is itself a check.
+            let app = router(db.clone(), "t0ken");
+            let mut request = Request::builder().uri(uri.to_owned());
+            if let Some(token) = token {
+                request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+            }
+            app.oneshot(request.body(axum::body::Body::empty()).unwrap())
+        };
+
+        // Metadata resolves for a project named "meta" without colliding with its own route.
+        assert_eq!(
+            call("/api/project-meta/meta", Some("t0ken"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            call("/api/project-meta/app", Some("t0ken"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        // `meta` is a normal project name in the secrets namespace, not a reserved word.
+        assert_eq!(
+            call("/api/projects/meta/dev", Some("t0ken"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN,
+            "should reach list_secrets and fail on the project header, not route elsewhere"
+        );
+        // An unknown environment still reaches the env check rather than the metadata handler.
+        assert_eq!(
+            call("/api/projects/app/meta", Some("t0ken"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        // Every route, healthz included, sits behind the bearer layer.
+        for uri in ["/healthz", "/api/project-meta/app"] {
+            assert_eq!(
+                call(uri, None).await.unwrap().status(),
+                StatusCode::UNAUTHORIZED,
+                "{uri}"
+            );
+            assert_eq!(
+                call(uri, Some("wrong")).await.unwrap().status(),
+                StatusCode::UNAUTHORIZED,
+                "{uri}"
+            );
+        }
+        assert_eq!(
+            call("/healthz", Some("t0ken")).await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        drop(db);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// A name that only differs by surrounding whitespace must reach the same row, because
+    /// `create_project` stores the trimmed form and the client binds it as associated data.
+    #[tokio::test]
+    async fn project_names_are_canonicalized_on_every_path() {
+        let path = std::env::temp_dir().join(format!("keyben-trim-{}.db", rand::random::<u64>()));
+        let db = Db::open(&path).await.unwrap();
+
+        let salt = crypto::generate_salt();
+        let keys = crypto::derive_project_keys("pw", &salt).unwrap();
+        let dek = crypto::generate_dek();
+        create_project(
+            State(db.clone()),
+            Json(CreateProject {
+                name: "  app  ".to_owned(),
+                salt: B64.encode(salt),
+                wrapped_dek: crypto::wrap_dek(&keys, &dek, "app").unwrap(),
+                auth_hash: keys.auth_hash_b64(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        // The untrimmed name resolves rather than 404ing.
+        let Json(meta) = get_project_meta(State(db.clone()), AxumPath(" app ".to_owned()))
+            .await
+            .unwrap();
+        assert_eq!(meta.salt, B64.encode(salt));
+
+        // And so does a write followed by a read through differently-padded names.
+        let blob = crypto::encrypt_secret(&dek, "app", "dev", "K", "v").unwrap();
+        set_secret(
+            State(db.clone()),
+            AxumPath((" app".to_owned(), "dev".to_owned(), "K".to_owned())),
+            auth_headers(&keys),
+            Json(SecretValue {
+                value: blob.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+        let Json(secret) = get_secret(
+            State(db.clone()),
+            AxumPath(("app  ".to_owned(), "dev".to_owned(), "K".to_owned())),
+            auth_headers(&keys),
+        )
+        .await
+        .unwrap();
+        assert_eq!(secret.value, blob);
+
+        // An all-whitespace name is still rejected outright.
+        assert_eq!(
+            get_project_meta(State(db.clone()), AxumPath("   ".to_owned()))
+                .await
+                .unwrap_err()
+                .status,
+            StatusCode::BAD_REQUEST
+        );
+
+        drop(db);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[tokio::test]

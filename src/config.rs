@@ -1,4 +1,8 @@
 //! Project-local client configuration stored in `.keyben.toml`.
+//!
+//! The server URL and token are encrypted under the *project* password, so a user has only one
+//! password to remember. That password never unlocks anything the token alone could reach: the
+//! file holds no key material, and the project DEK stays wrapped on the server.
 
 use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
@@ -7,9 +11,10 @@ use std::path::PathBuf;
 
 use crate::crypto;
 
-pub const FILE_NAME: &str = ".keyben.toml";
-
 /// Current on-disk format version. v2 derives the file key with Argon2id + a per-file salt.
+///
+/// The salt is per file, not the project's server-side salt, so this file's key is independent
+/// of the project master key even though both come from the same password.
 const VERSION: u32 = 2;
 
 /// Associated-data roles binding each encrypted field to its purpose.
@@ -20,7 +25,7 @@ const TOKEN_ROLE: &str = "cfg-token-v2";
 struct StoredConfig {
     version: u32,
     project_name: String,
-    /// Base64 Argon2id salt for the configuration password.
+    /// Base64 Argon2id salt for the project password.
     salt: String,
     encrypted_server: String,
     encrypted_token: String,
@@ -34,7 +39,7 @@ pub struct Config {
 }
 
 pub fn path() -> Result<PathBuf> {
-    Ok(std::env::current_dir()?.join(FILE_NAME))
+    Ok(std::env::current_dir()?.join(".keyben.toml"))
 }
 
 pub fn exists() -> Result<bool> {
@@ -43,7 +48,7 @@ pub fn exists() -> Result<bool> {
 
 pub fn write(config: &Config, password: &str) -> Result<PathBuf> {
     if password.is_empty() {
-        bail!("Configuration password cannot be empty");
+        bail!("Project password cannot be empty");
     }
     let salt = crypto::generate_salt();
     let key = crypto::argon2id_key(password, &salt)?;
@@ -76,11 +81,10 @@ pub fn read(password: &str) -> Result<Config> {
         .decode(stored.salt.trim())
         .context("Invalid salt in .keyben.toml")?;
     let key = crypto::argon2id_key(password, &salt)?;
-    let server = crypto::config_decrypt(&key, SERVER_ROLE, &stored.encrypted_server).context(
-        "Failed to decrypt server URL; incorrect configuration password or corrupted file",
-    )?;
+    let server = crypto::config_decrypt(&key, SERVER_ROLE, &stored.encrypted_server)
+        .context("Failed to decrypt server URL; incorrect project password or corrupted file")?;
     let token = crypto::config_decrypt(&key, TOKEN_ROLE, &stored.encrypted_token)
-        .context("Failed to decrypt token; incorrect configuration password or corrupted file")?;
+        .context("Failed to decrypt token; incorrect project password or corrupted file")?;
     validate(&stored.project_name, &server, &token)?;
     Ok(Config {
         project_name: stored.project_name,

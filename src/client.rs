@@ -51,30 +51,31 @@ pub async fn run(cli: Cli) -> Result<()> {
     let project_arg = project_name_arg(command);
     let runtime = resolve_runtime(&cli, project_arg)?;
     let api = Api::new(Some(&runtime.server), Some(&runtime.token), cli.insecure)?;
+    let project_name = runtime.project_name.as_str();
 
     match command {
-        Command::Init { project_name } => {
-            let project_name = project_name.as_deref().unwrap_or(&runtime.project_name);
-            let password = resolve_new_password(
-                cli.password.as_ref(),
-                "Enter the new project password",
-                "use --password or KEYBEN_PASSWORD in non-interactive environments",
-            )?;
+        Command::Init { .. } => {
+            // A password already resolved for `.keyben.toml` was confirmed when that file was
+            // written, so reuse it instead of asking for a fresh confirmation here.
+            let password = match &runtime.password {
+                Some(password) => password.clone(),
+                None => resolve_new_password(
+                    cli.password.as_ref(),
+                    "Enter the new project password",
+                    "use --password or KEYBEN_PASSWORD in non-interactive environments",
+                )?,
+            };
             api.create_project(project_name, &password).await?;
             println!("Project `{project_name}` created");
         }
 
         Command::Secrets { action } => match action {
             SecretsCommand::Set {
-                project_name,
-                env,
-                name,
-                value,
+                env, name, value, ..
             } => {
-                let password = resolve_password(&cli.password)?;
+                let password = runtime.project_password(&cli.password)?;
                 let name = resolve_secret_name(name)?;
                 let value = resolve_secret_value(value)?;
-                let project_name = project_name.as_deref().unwrap_or(&runtime.project_name);
                 let session = api.unlock(project_name, &password).await?;
                 let blob = crypto::encrypt_secret(
                     &session.dek,
@@ -89,12 +90,11 @@ pub async fn run(cli: Cli) -> Result<()> {
             }
 
             SecretsCommand::Get {
-                project_name,
                 env,
                 name: Some(name),
+                ..
             } => {
-                let password = resolve_password(&cli.password)?;
-                let project_name = project_name.as_deref().unwrap_or(&runtime.project_name);
+                let password = runtime.project_password(&cli.password)?;
                 let session = api.unlock(project_name, &password).await?;
                 let blob = api.get_secret(project_name, *env, name, &session).await?;
                 println!(
@@ -104,25 +104,17 @@ pub async fn run(cli: Cli) -> Result<()> {
             }
 
             SecretsCommand::Get {
-                project_name,
-                env,
-                name: None,
+                env, name: None, ..
             } => {
-                let password = resolve_password(&cli.password)?;
-                let project_name = project_name.as_deref().unwrap_or(&runtime.project_name);
+                let password = runtime.project_password(&cli.password)?;
                 let session = api.unlock(project_name, &password).await?;
                 for (name, value) in api.fetch_all(project_name, *env, &session).await? {
                     println!("{name}={value}");
                 }
             }
 
-            SecretsCommand::Delete {
-                project_name,
-                env,
-                name,
-            } => {
-                let password = resolve_password(&cli.password)?;
-                let project_name = project_name.as_deref().unwrap_or(&runtime.project_name);
+            SecretsCommand::Delete { env, name, .. } => {
+                let password = runtime.project_password(&cli.password)?;
                 let session = api.unlock(project_name, &password).await?;
                 api.delete_secret(project_name, *env, name, &session)
                     .await?;
@@ -131,24 +123,24 @@ pub async fn run(cli: Cli) -> Result<()> {
         },
 
         Command::Password { action } => match action {
-            PasswordCommand::Reset {
-                project_name,
-                new_password,
-            } => {
-                let project_name = project_name.as_deref().unwrap_or(&runtime.project_name);
-                reset_project_password(&api, project_name, &cli.password, new_password.as_ref())
+            PasswordCommand::Reset { new_password, .. } => {
+                let old_password = runtime.project_password(&cli.password)?;
+                reset_project_password(&api, project_name, &old_password, new_password.as_ref())
                     .await?;
-                println!("Reset password for project `{project_name}`");
+                if config::exists()? {
+                    println!(
+                        "Reset password for project `{project_name}`.\n\
+                         Note: .keyben.toml is still encrypted under the old password; \
+                         recreate it with `keyben config init` to use the new one."
+                    );
+                } else {
+                    println!("Reset password for project `{project_name}`");
+                }
             }
         },
 
-        Command::Run {
-            project_name,
-            env,
-            argv,
-        } => {
-            let password = resolve_password(&cli.password)?;
-            let project_name = project_name.as_deref().unwrap_or(&runtime.project_name);
+        Command::Run { env, argv, .. } => {
+            let password = runtime.project_password(&cli.password)?;
             let session = api.unlock(project_name, &password).await?;
             let secrets = api.fetch_all(project_name, *env, &session).await?;
             exec(argv, secrets)?;
@@ -165,6 +157,19 @@ struct RuntimeConfig {
     project_name: String,
     server: String,
     token: String,
+    /// The password already resolved to decrypt `.keyben.toml`, when that file was read.
+    password: Option<String>,
+}
+
+impl RuntimeConfig {
+    /// One password unlocks both `.keyben.toml` and the project itself, so reuse the value
+    /// already resolved for the file rather than prompting a second time.
+    fn project_password(&self, from_args: &Option<String>) -> Result<String> {
+        match &self.password {
+            Some(password) => Ok(password.clone()),
+            None => resolve_password(from_args),
+        }
+    }
 }
 
 fn project_name_arg(command: &Command) -> Option<&str> {
@@ -186,11 +191,12 @@ fn project_name_arg(command: &Command) -> Option<&str> {
 
 fn resolve_runtime(cli: &Cli, project_arg: Option<&str>) -> Result<RuntimeConfig> {
     let needs_file = cli.server.is_none() || cli.token.is_none() || project_arg.is_none();
-    let file_config = if needs_file && config::exists()? {
-        let password = resolve_config_password(&cli.config_password)?;
-        Some(config::read(&password)?)
+    let (file_config, password) = if needs_file && config::exists()? {
+        // The project password doubles as the `.keyben.toml` password.
+        let password = resolve_password(&cli.password)?;
+        (Some(config::read(&password)?), Some(password))
     } else {
-        None
+        (None, None)
     };
 
     let project_name = project_arg
@@ -211,16 +217,18 @@ fn resolve_runtime(cli: &Cli, project_arg: Option<&str>) -> Result<RuntimeConfig
     let token = token.filter(|s| !s.trim().is_empty()).context(
         "Missing authentication token; use --token, KEYBEN_TOKEN, or create .keyben.toml",
     )?;
-    let project_name = if project_name.trim().is_empty() {
-        bail!("Missing project name; use --projectName or create .keyben.toml")
-    } else {
-        project_name
-    };
-    config::validate_values(&project_name, &server, &token)?;
+    // Canonicalize once here: the name keys the server row and is bound as associated data,
+    // so an untrimmed copy would look up a row that does not exist.
+    let project_name = project_name.trim();
+    if project_name.is_empty() {
+        bail!("Missing project name; use --projectName or create .keyben.toml");
+    }
+    config::validate_values(project_name, &server, &token)?;
     Ok(RuntimeConfig {
-        project_name,
+        project_name: project_name.to_owned(),
         server,
         token,
+        password,
     })
 }
 
@@ -241,11 +249,24 @@ async fn run_config_command(action: &ConfigCommand, cli: &Cli) -> Result<()> {
                 .clone()
                 .or_else(|| prompt_text("Enter the authentication token"))
                 .context("Missing authentication token; use --token")?;
+            let project_name = project_name.trim().to_owned();
             config::validate_values(&project_name, &server, &token)?;
+            if config::exists()? {
+                let file = config::path()?;
+                let overwrite = dialoguer::Confirm::new()
+                    .with_prompt(format!("{} already exists; overwrite it?", file.display()))
+                    .default(false)
+                    .interact()
+                    .unwrap_or(false);
+                if !overwrite {
+                    bail!("Cancelled; {} was left unchanged", file.display());
+                }
+            }
+            // The project password also encrypts this file, so there is only one to remember.
             let password = resolve_new_password(
-                cli.config_password.as_ref(),
-                "Enter the configuration password",
-                "use --config-password or KEYBEN_CONFIG_PASSWORD",
+                cli.password.as_ref(),
+                "Enter the project password",
+                "use --password or KEYBEN_PASSWORD",
             )?;
             let file = config::write(
                 &Config {
@@ -259,17 +280,6 @@ async fn run_config_command(action: &ConfigCommand, cli: &Cli) -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn resolve_config_password(from_args: &Option<String>) -> Result<String> {
-    if let Some(value) = from_args {
-        if value.is_empty() {
-            bail!("Configuration password cannot be empty");
-        }
-        return Ok(value.clone());
-    }
-    dialoguer::Password::new().with_prompt("Enter the configuration password").interact()
-        .context("Failed to read configuration password (use --config-password or KEYBEN_CONFIG_PASSWORD)")
 }
 
 fn prompt_text(prompt: &str) -> Option<String> {
@@ -349,10 +359,9 @@ fn derive_keys(project: &str, password: &str, salt_b64: &str) -> Result<crypto::
 async fn reset_project_password(
     api: &Api,
     project: &str,
-    old_password_args: &Option<String>,
+    old_password: &str,
     new_password_args: Option<&String>,
 ) -> Result<()> {
-    let old_password = resolve_password(old_password_args)?;
     let new_password = resolve_new_password(
         new_password_args,
         "Enter the new project password",
@@ -365,7 +374,7 @@ async fn reset_project_password(
     // Unlock the project with the old password to recover the DEK, then re-wrap the *same*
     // DEK under a fresh salt and new password. Secret ciphertext is never touched.
     let meta = api.fetch_meta(project).await?;
-    let old_keys = derive_keys(project, &old_password, &meta.salt)?;
+    let old_keys = derive_keys(project, old_password, &meta.salt)?;
     let dek = crypto::unwrap_dek(&old_keys, &meta.wrapped_dek, project)
         .context("Failed to unlock the project with the current password")?;
 
@@ -383,15 +392,41 @@ async fn reset_project_password(
     .await
 }
 
+/// keyben's own credentials, which automation supplies through the environment. A child that
+/// dumps its environment would otherwise expose the project password and the server token.
+const CREDENTIAL_ENV_VARS: [&str; 4] = [
+    "KEYBEN_TOKEN",
+    "KEYBEN_PASSWORD",
+    "KEYBEN_NEW_PASSWORD",
+    "KEYBEN_CONFIG_PASSWORD",
+];
+
+/// Build the child process: inherit the caller's environment, add the decrypted secrets, and
+/// drop keyben's own credentials so they cannot leak into the child.
+fn build_child_command(
+    program: &str,
+    args: &[String],
+    secrets: &BTreeMap<String, String>,
+) -> ProcessCommand {
+    let mut command = ProcessCommand::new(program);
+    command.args(args).envs(secrets);
+    // Strip inherited credentials, but never a variable the project itself defines under one
+    // of these names: an explicit secret wins over the ambient value.
+    for name in CREDENTIAL_ENV_VARS {
+        if !secrets.contains_key(name) {
+            command.env_remove(name);
+        }
+    }
+    command
+}
+
 /// Inject decrypted environment variables, launch the child process unchanged, and propagate its exit code.
 fn exec(argv: &[String], secrets: BTreeMap<String, String>) -> Result<()> {
     let (program, args) = argv
         .split_first()
         .context("A program to execute must be provided after `--`")?;
 
-    let status = ProcessCommand::new(program)
-        .args(args)
-        .envs(&secrets)
+    let status = build_child_command(program, args, &secrets)
         .status()
         .with_context(|| format!("Failed to execute `{program}`"))?;
 
@@ -506,7 +541,7 @@ impl Api {
 
     /// Fetch the public metadata (salt + wrapped DEK) needed to derive keys. Bearer-only.
     async fn fetch_meta(&self, project: &str) -> Result<ProjectMeta> {
-        let url = self.url(&[project, "meta"]);
+        let url = format!("{}/api/project-meta/{}", self.base, percent_encode(project));
         self.send(self.http.get(url))
             .await?
             .json()
@@ -669,12 +704,60 @@ const PROJECT_AUTH_HEADER: &str = "x-keyben-project-auth";
 
 #[cfg(test)]
 mod tests {
-    use super::percent_encode;
+    use super::*;
 
     #[test]
     fn encodes_reserved_characters() {
         assert_eq!(percent_encode("DB_URL"), "DB_URL");
         assert_eq!(percent_encode("a/b c"), "a%2Fb%20c");
         assert_eq!(percent_encode("é"), "%C3%A9");
+    }
+
+    /// Look up how a name is configured on the child: `Some` is an explicit value, `None` means
+    /// the child will not inherit it, and absent means it inherits the caller's value.
+    fn child_env<'a>(command: &'a ProcessCommand, name: &str) -> Option<Option<&'a str>> {
+        command
+            .get_envs()
+            .find(|(key, _)| *key == name)
+            .map(|(_, value)| value.map(|v| v.to_str().unwrap()))
+    }
+
+    /// Automation supplies these through the environment, so a child that dumps its environment
+    /// would otherwise expose the project password and the server token.
+    #[test]
+    fn child_process_does_not_inherit_keyben_credentials() {
+        let secrets = BTreeMap::from([("DB_URL".to_owned(), "postgres://x".to_owned())]);
+        let command = build_child_command("sh", &[], &secrets);
+
+        for name in CREDENTIAL_ENV_VARS {
+            assert_eq!(
+                child_env(&command, name),
+                Some(None),
+                "{name} must be cleared rather than inherited"
+            );
+        }
+        assert_eq!(
+            child_env(&command, "DB_URL"),
+            Some(Some("postgres://x")),
+            "decrypted secrets must still reach the child"
+        );
+        // Everything else is inherited untouched.
+        assert_eq!(child_env(&command, "PATH"), None);
+    }
+
+    /// A project may legitimately store a secret under one of those names; it must not be
+    /// stripped along with the ambient value.
+    #[test]
+    fn an_explicit_secret_overrides_the_inherited_credential() {
+        let secrets = BTreeMap::from([("KEYBEN_TOKEN".to_owned(), "from-project".to_owned())]);
+        let args = ["-c".to_owned(), "printf '%s' \"$KEYBEN_TOKEN\"".to_owned()];
+
+        assert_eq!(
+            child_env(&build_child_command("sh", &args, &secrets), "KEYBEN_TOKEN"),
+            Some(Some("from-project"))
+        );
+        // And confirm the child really observes it.
+        let output = build_child_command("sh", &args, &secrets).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "from-project");
     }
 }
