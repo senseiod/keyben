@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
-argon2 = "0.5.3"
+argon2 = { version = "0.5.3", features = ["zeroize"] }
 axum = "0.8.9"
 axum-server = { version = "0.8.0", features = ["tls-rustls"] }
 base64 = "0.23.1"
@@ -25,15 +25,16 @@ toml = "1.1.4"
 tower-http = { version = "0.7.0", features = ["validate-request", "trace"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+zeroize = "1.9.0"
 
 [dev-dependencies]
 # Drives the real Router through tower's ServiceExt so route tests exercise the actual table.
 tower = { version = "0.5.3", features = ["util"] }
 
-# Optimize the shipped single-binary artifact for size and speed.
+# Optimize the shipped single-binary artifact for size and speed. Unwinding is kept on
+# purpose: a panic that aborts would skip the destructors that wipe key material.
 [profile.release]
 opt-level = 3
 lto = "thin"
 codegen-units = 1
-panic = "abort"
 strip = "symbols"

@@ -767,7 +767,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            crypto::decrypt_secret(&dek, "app", "dev", "DB_URL", &secret.value).unwrap(),
+            *crypto::decrypt_secret(&dek, "app", "dev", "DB_URL", &secret.value).unwrap(),
             "postgres://x"
         );
 

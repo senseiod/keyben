@@ -51,7 +51,7 @@ Every value is encrypted with its `(project, env, name)` bound in as associated 
 ### Limitations
 
 - A weak password is still weak. Argon2id and a per-project salt make each guess expensive and rule out rainbow tables and cross-project key reuse, but short or common passwords fall anyway. Use a long random one.
-- Key material is not zeroized. Derived keys, the DEK, and password strings can survive in a core dump or swap file. The release profile uses `panic = "abort"`, which makes a dump somewhat more likely.
+- Zeroization is best effort. Derived keys, the DEK, passwords, and decrypted values are wiped when they go out of scope, but the operating system may already have copied a page to swap, and a value handed to a child process lives on in that child.
 - The server is not trusted for availability or integrity. It cannot read your data, but it can delete it, withhold it, or return something else. Keep backups.
 - The token is not an identity system. No users, roles, scopes, token rotation, or audit logs.
 - TLS is optional. Without `cert` and `key` the server speaks plaintext HTTP, and the project authentication header can then be replayed by anyone on the same network.

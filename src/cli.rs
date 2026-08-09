@@ -6,6 +6,16 @@
 
 use clap::{ArgAction, Parser, Subcommand, ValueEnum, builder::BoolishValueParser};
 use std::path::PathBuf;
+use zeroize::Zeroizing;
+
+/// A password parsed from the command line or the environment, wiped from memory on drop.
+pub type Password = Zeroizing<String>;
+
+/// Parse a password argument straight into its wiping wrapper, so clap never stores a bare
+/// `String` copy that outlives the process without being cleared.
+fn wiped_on_drop(value: &str) -> Result<Password, std::convert::Infallible> {
+    Ok(Zeroizing::new(value.to_owned()))
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -49,9 +59,10 @@ pub struct Cli {
         global = true,
         env = "KEYBEN_PASSWORD",
         value_name = "PASSWORD",
-        hide_env_values = true
+        hide_env_values = true,
+        value_parser = wiped_on_drop
     )]
-    pub password: Option<String>,
+    pub password: Option<Password>,
 
     /// Skip TLS certificate verification (for private networks with self-signed certificates only).
     #[arg(
@@ -193,9 +204,10 @@ pub enum PasswordCommand {
             long = "new-password",
             env = "KEYBEN_NEW_PASSWORD",
             value_name = "PASSWORD",
-            hide_env_values = true
+            hide_env_values = true,
+            value_parser = wiped_on_drop
         )]
-        new_password: Option<String>,
+        new_password: Option<Password>,
     },
 }
 
@@ -239,7 +251,7 @@ mod tests {
         ])
         .unwrap();
 
-        assert_eq!(cli.password.as_deref(), Some("123"));
+        assert_eq!(cli.password.as_deref().map(String::as_str), Some("123"));
     }
 
     #[test]
@@ -268,8 +280,14 @@ mod tests {
             panic!("expected password reset command");
         };
         assert_eq!(project_name.as_deref(), Some("frontierkings"));
-        assert_eq!(new_password.as_deref(), Some("new-password"));
-        assert_eq!(cli.password.as_deref(), Some("old-password"));
+        assert_eq!(
+            new_password.as_deref().map(String::as_str),
+            Some("new-password")
+        );
+        assert_eq!(
+            cli.password.as_deref().map(String::as_str),
+            Some("old-password")
+        );
     }
 
     #[test]

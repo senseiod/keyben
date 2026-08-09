@@ -3,11 +3,14 @@
 //! The server URL and token are encrypted under the *project* password, so a user has only one
 //! password to remember. That password never unlocks anything the token alone could reach: the
 //! file holds no key material, and the project DEK stays wrapped on the server.
+//!
+//! The decrypted token is kept in a wrapper that wipes it on drop, since it is a credential.
 
 use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use zeroize::Zeroizing;
 
 use crate::crypto;
 
@@ -35,7 +38,8 @@ struct StoredConfig {
 pub struct Config {
     pub project_name: String,
     pub server: String,
-    pub token: String,
+    /// A credential, so it is wiped from memory when this value is dropped.
+    pub token: Zeroizing<String>,
 }
 
 pub fn path() -> Result<PathBuf> {
@@ -88,7 +92,7 @@ pub fn read(password: &str) -> Result<Config> {
     validate(&stored.project_name, &server, &token)?;
     Ok(Config {
         project_name: stored.project_name,
-        server,
+        server: server.to_string(),
         token,
     })
 }
@@ -119,7 +123,7 @@ mod tests {
         let value = Config {
             project_name: "app".into(),
             server: "https://example.com".into(),
-            token: "secret".into(),
+            token: Zeroizing::new("secret".to_owned()),
         };
         let salt = crypto::generate_salt();
         let key = crypto::argon2id_key("pw", &salt).unwrap();
@@ -135,7 +139,7 @@ mod tests {
         let parsed_salt = B64.decode(&parsed.salt).unwrap();
         let parsed_key = crypto::argon2id_key("pw", &parsed_salt).unwrap();
         assert_eq!(
-            crypto::config_decrypt(&parsed_key, SERVER_ROLE, &parsed.encrypted_server).unwrap(),
+            *crypto::config_decrypt(&parsed_key, SERVER_ROLE, &parsed.encrypted_server).unwrap(),
             value.server
         );
         assert_eq!(

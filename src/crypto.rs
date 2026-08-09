@@ -13,6 +13,10 @@
 //! Blob format (Base64-encoded): `[24-byte XNonce] + [ciphertext || 16-byte Poly1305 tag]`.
 //! Every AEAD operation binds associated data (project / env / name) so ciphertext cannot be
 //! moved between locations.
+//!
+//! Every value that is key material — the Argon2 master key, both subkeys, the DEK, and any
+//! decrypted plaintext — is held in a [`Zeroizing`] wrapper, so it is wiped from memory when it
+//! goes out of scope rather than left behind for a core dump or swap file.
 
 use anyhow::{Context, Result, anyhow, bail};
 use argon2::{Algorithm, Argon2, Params, Version};
@@ -23,6 +27,7 @@ use chacha20poly1305::{
 };
 use hkdf::Hkdf;
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 /// Argon2 salt length in bytes (public, stored alongside the project).
 pub const SALT_LEN: usize = 16;
@@ -33,38 +38,47 @@ const NONCE_LEN: usize = 24;
 /// Poly1305 authentication tag length in bytes.
 const TAG_LEN: usize = 16;
 
+/// A 32-byte symmetric key, wiped from memory when it goes out of scope.
+pub type SecretKey = Zeroizing<[u8; KEY_LEN]>;
+
+/// A decrypted value, wiped from memory when it goes out of scope.
+pub type SecretText = Zeroizing<String>;
+
 /// Generate a random Argon2 salt for a new project or configuration file.
 pub fn generate_salt() -> [u8; SALT_LEN] {
     rand::random()
 }
 
 /// Generate a random 32-byte data-encryption key for a new project.
-pub fn generate_dek() -> [u8; KEY_LEN] {
-    rand::random()
+pub fn generate_dek() -> SecretKey {
+    Zeroizing::new(rand::random())
 }
 
 /// The per-project subkeys derived from a password and its salt.
+///
+/// Both fields wipe themselves on drop, so a `ProjectKeys` leaves nothing behind.
 pub struct ProjectKeys {
     /// Wraps and unwraps the project DEK; never leaves the client.
-    enc_key: [u8; KEY_LEN],
+    enc_key: SecretKey,
     /// Proves knowledge of the password to the server.
-    auth_secret: [u8; KEY_LEN],
+    auth_secret: SecretKey,
 }
 
 impl ProjectKeys {
     /// Base64 `auth_secret` sent in the request header.
     pub fn auth_secret_b64(&self) -> String {
-        B64.encode(self.auth_secret)
+        B64.encode(&self.auth_secret)
     }
 
     /// Base64 `SHA-256(auth_secret)` stored on the server for constant-time comparison.
     pub fn auth_hash_b64(&self) -> String {
-        B64.encode(Sha256::digest(self.auth_secret))
+        B64.encode(Sha256::digest(&self.auth_secret))
     }
 }
 
 /// Derive the per-project subkeys from the password and its salt.
 pub fn derive_project_keys(password: &str, salt: &[u8]) -> Result<ProjectKeys> {
+    // `master_key` is wiped when this function returns; only the subkeys survive.
     let master_key = argon2id_key(password, salt)?;
     // The two info labels domain-separate the subkeys: neither reveals the other.
     Ok(ProjectKeys {
@@ -76,23 +90,23 @@ pub fn derive_project_keys(password: &str, salt: &[u8]) -> Result<ProjectKeys> {
 /// Derive a raw 32-byte key from a password and salt with Argon2id.
 ///
 /// Used directly for the local configuration file, and internally as the project master key.
-pub fn argon2id_key(password: &str, salt: &[u8]) -> Result<[u8; KEY_LEN]> {
+pub fn argon2id_key(password: &str, salt: &[u8]) -> Result<SecretKey> {
     // m = 64 MiB, t = 3 iterations, p = 4 lanes.
     let params = Params::new(64 * 1024, 3, 4, Some(KEY_LEN))
         .map_err(|err| anyhow!("Invalid Argon2 parameters: {err}"))?;
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-    let mut key = [0u8; KEY_LEN];
+    let mut key: SecretKey = Zeroizing::new([0u8; KEY_LEN]);
     argon2
-        .hash_password_into(password.as_bytes(), salt, &mut key)
+        .hash_password_into(password.as_bytes(), salt, key.as_mut_slice())
         .map_err(|err| anyhow!("Argon2 key derivation failed: {err}"))?;
     Ok(key)
 }
 
 /// Expand the master key into a domain-separated 32-byte subkey with HKDF-SHA256.
-fn hkdf_subkey(master_key: &[u8; KEY_LEN], info: &[u8]) -> [u8; KEY_LEN] {
-    let hkdf = Hkdf::<Sha256>::new(None, master_key);
-    let mut subkey = [0u8; KEY_LEN];
-    hkdf.expand(info, &mut subkey)
+fn hkdf_subkey(master_key: &SecretKey, info: &[u8]) -> SecretKey {
+    let hkdf = Hkdf::<Sha256>::new(None, master_key.as_slice());
+    let mut subkey: SecretKey = Zeroizing::new([0u8; KEY_LEN]);
+    hkdf.expand(info, subkey.as_mut_slice())
         .expect("32 is a valid HKDF-SHA256 output length");
     subkey
 }
@@ -119,10 +133,17 @@ fn aad(parts: &[&[u8]]) -> Vec<u8> {
     parts.join(&0u8)
 }
 
+/// Build the AEAD from a wrapped key without copying it out of its wrapper.
+fn cipher(key: &SecretKey) -> XChaCha20Poly1305 {
+    // The `&**` reborrows the fixed-size array the wrapper holds, which is the shape the
+    // cipher's key type converts from.
+    XChaCha20Poly1305::new((&**key).into())
+}
+
 /// Encrypt `plaintext` under `key`, binding `associated_data`, into Base64 `nonce || ciphertext || tag`.
-fn seal(key: &[u8; KEY_LEN], associated_data: &[u8], plaintext: &[u8]) -> Result<String> {
+fn seal(key: &SecretKey, associated_data: &[u8], plaintext: &[u8]) -> Result<String> {
     let nonce_bytes: [u8; NONCE_LEN] = rand::random();
-    let ciphertext = XChaCha20Poly1305::new(key.into())
+    let ciphertext = cipher(key)
         .encrypt(
             &XNonce::from(nonce_bytes),
             Payload {
@@ -139,7 +160,10 @@ fn seal(key: &[u8; KEY_LEN], associated_data: &[u8], plaintext: &[u8]) -> Result
 }
 
 /// Decrypt a Base64 blob produced by [`seal`], verifying `associated_data`.
-fn open(key: &[u8; KEY_LEN], associated_data: &[u8], blob: &str) -> Result<Vec<u8>> {
+///
+/// The plaintext is returned in a wrapper that wipes it on drop, since callers decrypt either
+/// key material or secret values.
+fn open(key: &SecretKey, associated_data: &[u8], blob: &str) -> Result<Zeroizing<Vec<u8>>> {
     let raw = B64
         .decode(blob.trim())
         .context("Base64 decoding failed: the data was not written by this tool")?;
@@ -153,7 +177,7 @@ fn open(key: &[u8; KEY_LEN], associated_data: &[u8], blob: &str) -> Result<Vec<u
 
     let (nonce_bytes, ciphertext) = raw.split_at(NONCE_LEN);
     let nonce = XNonce::try_from(nonce_bytes).expect("length was validated as 24 bytes");
-    XChaCha20Poly1305::new(key.into())
+    cipher(key)
         .decrypt(
             &nonce,
             Payload {
@@ -161,28 +185,38 @@ fn open(key: &[u8; KEY_LEN], associated_data: &[u8], blob: &str) -> Result<Vec<u
                 aad: associated_data,
             },
         )
+        .map(Zeroizing::new)
         .map_err(|_| anyhow!("Decryption failed: incorrect password or tampered data"))
+}
+
+/// Decode decrypted bytes as UTF-8 without leaving an un-wiped copy behind.
+fn into_text(plaintext: Zeroizing<Vec<u8>>, context: &'static str) -> Result<SecretText> {
+    let text = std::str::from_utf8(&plaintext).context(context)?;
+    Ok(Zeroizing::new(text.to_owned()))
 }
 
 // ----------------------------------------------------------------- Envelope API
 
 /// Wrap a project DEK with the password-derived `enc_key`, bound to the project name.
-pub fn wrap_dek(keys: &ProjectKeys, dek: &[u8; KEY_LEN], project: &str) -> Result<String> {
-    seal(&keys.enc_key, &wrap_aad(project), dek)
+pub fn wrap_dek(keys: &ProjectKeys, dek: &SecretKey, project: &str) -> Result<String> {
+    seal(&keys.enc_key, &wrap_aad(project), dek.as_slice())
 }
 
 /// Unwrap a project DEK previously produced by [`wrap_dek`].
-pub fn unwrap_dek(keys: &ProjectKeys, wrapped: &str, project: &str) -> Result<[u8; KEY_LEN]> {
+pub fn unwrap_dek(keys: &ProjectKeys, wrapped: &str, project: &str) -> Result<SecretKey> {
     let dek = open(&keys.enc_key, &wrap_aad(project), wrapped).context(
         "Failed to unwrap the project key; incorrect password or corrupted project metadata",
     )?;
-    dek.try_into()
-        .map_err(|_| anyhow!("Unwrapped project key has an invalid length"))
+    let bytes: [u8; KEY_LEN] = dek
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow!("Unwrapped project key has an invalid length"))?;
+    Ok(Zeroizing::new(bytes))
 }
 
 /// Encrypt a secret value with the project DEK, bound to `(project, env, name)`.
 pub fn encrypt_secret(
-    dek: &[u8; KEY_LEN],
+    dek: &SecretKey,
     project: &str,
     env: &str,
     name: &str,
@@ -193,14 +227,14 @@ pub fn encrypt_secret(
 
 /// Decrypt a secret value produced by [`encrypt_secret`].
 pub fn decrypt_secret(
-    dek: &[u8; KEY_LEN],
+    dek: &SecretKey,
     project: &str,
     env: &str,
     name: &str,
     blob: &str,
-) -> Result<String> {
+) -> Result<SecretText> {
     let plaintext = open(dek, &secret_aad(project, env, name), blob)?;
-    String::from_utf8(plaintext).context("Decrypted result is not valid UTF-8 text")
+    into_text(plaintext, "Decrypted result is not valid UTF-8 text")
 }
 
 // -------------------------------------------------------- Local config-file API
@@ -209,14 +243,17 @@ pub fn decrypt_secret(
 ///
 /// `role` (for example `"cfg-server-v2"`) is bound as associated data so one field's
 /// ciphertext cannot be swapped into another field.
-pub fn config_encrypt(key: &[u8; 32], role: &str, plaintext: &str) -> Result<String> {
+pub fn config_encrypt(key: &SecretKey, role: &str, plaintext: &str) -> Result<String> {
     seal(key, role.as_bytes(), plaintext.as_bytes())
 }
 
 /// Decrypt a configuration field produced by [`config_encrypt`].
-pub fn config_decrypt(key: &[u8; 32], role: &str, blob: &str) -> Result<String> {
+pub fn config_decrypt(key: &SecretKey, role: &str, blob: &str) -> Result<SecretText> {
     let plaintext = open(key, role.as_bytes(), blob)?;
-    String::from_utf8(plaintext).context("Decrypted configuration value is not valid UTF-8 text")
+    into_text(
+        plaintext,
+        "Decrypted configuration value is not valid UTF-8 text",
+    )
 }
 
 #[cfg(test)]
@@ -232,11 +269,11 @@ mod tests {
         let wrapped = wrap_dek(&keys, &dek, "app").unwrap();
 
         let unwrapped = unwrap_dek(&keys, &wrapped, "app").unwrap();
-        assert_eq!(unwrapped, dek);
+        assert_eq!(*unwrapped, *dek);
 
         let blob = encrypt_secret(&dek, "app", "dev", "DB_URL", "postgres://u:p@db/app").unwrap();
         assert_eq!(
-            decrypt_secret(&dek, "app", "dev", "DB_URL", &blob).unwrap(),
+            *decrypt_secret(&dek, "app", "dev", "DB_URL", &blob).unwrap(),
             "postgres://u:p@db/app"
         );
     }
@@ -271,7 +308,7 @@ mod tests {
         assert!(decrypt_secret(&dek, "app", "dev", "OTHER", &blob).is_err());
         assert!(decrypt_secret(&dek, "other", "dev", "DB_URL", &blob).is_err());
         assert_eq!(
-            decrypt_secret(&dek, "app", "dev", "DB_URL", &blob).unwrap(),
+            *decrypt_secret(&dek, "app", "dev", "DB_URL", &blob).unwrap(),
             "secret"
         );
     }
@@ -310,7 +347,7 @@ mod tests {
         for value in ["", "🔑 Unicode value", "multi\nline"] {
             let blob = encrypt_secret(&dek, "app", "dev", "K", value).unwrap();
             assert_eq!(
-                decrypt_secret(&dek, "app", "dev", "K", &blob).unwrap(),
+                *decrypt_secret(&dek, "app", "dev", "K", &blob).unwrap(),
                 value
             );
         }
@@ -321,7 +358,7 @@ mod tests {
         let key = argon2id_key("cfg-pw", &SALT).unwrap();
         let blob = config_encrypt(&key, "cfg-server-v2", "https://example.com").unwrap();
         assert_eq!(
-            config_decrypt(&key, "cfg-server-v2", &blob).unwrap(),
+            *config_decrypt(&key, "cfg-server-v2", &blob).unwrap(),
             "https://example.com"
         );
         // Wrong role (field swap) must fail.

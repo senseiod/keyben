@@ -1,4 +1,7 @@
 //! Client: all encryption and decryption happen here; the server only sends and receives Base64 ciphertext.
+//!
+//! Passwords, derived keys, and decrypted values are held in [`Zeroizing`] wrappers so they are
+//! wiped from memory on drop instead of lingering in a core dump or swap file.
 
 use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
@@ -6,9 +9,10 @@ use reqwest::{RequestBuilder, Response, StatusCode};
 use serde::Deserialize;
 use serde_json::json;
 use std::{collections::BTreeMap, process::Command as ProcessCommand, time::Duration};
+use zeroize::Zeroizing;
 
 use crate::{
-    cli::{Cli, Command, ConfigCommand, Env, PasswordCommand, SecretsCommand},
+    cli::{Cli, Command, ConfigCommand, Env, Password, PasswordCommand, SecretsCommand},
     config::{self, Config},
     crypto,
 };
@@ -33,9 +37,11 @@ struct ProjectMeta {
 
 /// An unlocked project: the password-derived keys plus the unwrapped DEK, ready to
 /// authenticate requests and encrypt or decrypt secrets.
+///
+/// Both fields wipe themselves when the session is dropped.
 struct ProjectSession {
     keys: crypto::ProjectKeys,
-    dek: [u8; 32],
+    dek: crypto::SecretKey,
 }
 
 /// Execute a subcommand in client mode.
@@ -50,7 +56,11 @@ pub async fn run(cli: Cli) -> Result<()> {
 
     let project_arg = project_name_arg(command);
     let runtime = resolve_runtime(&cli, project_arg)?;
-    let api = Api::new(Some(&runtime.server), Some(&runtime.token), cli.insecure)?;
+    let api = Api::new(
+        Some(runtime.server.as_str()),
+        Some(runtime.token.as_str()),
+        cli.insecure,
+    )?;
     let project_name = runtime.project_name.as_str();
 
     match command {
@@ -97,10 +107,9 @@ pub async fn run(cli: Cli) -> Result<()> {
                 let password = runtime.project_password(&cli.password)?;
                 let session = api.unlock(project_name, &password).await?;
                 let blob = api.get_secret(project_name, *env, name, &session).await?;
-                println!(
-                    "{}",
-                    crypto::decrypt_secret(&session.dek, project_name, env.as_str(), name, &blob)?
-                );
+                let value =
+                    crypto::decrypt_secret(&session.dek, project_name, env.as_str(), name, &blob)?;
+                println!("{}", value.as_str());
             }
 
             SecretsCommand::Get {
@@ -109,7 +118,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 let password = runtime.project_password(&cli.password)?;
                 let session = api.unlock(project_name, &password).await?;
                 for (name, value) in api.fetch_all(project_name, *env, &session).await? {
-                    println!("{name}={value}");
+                    println!("{name}={}", value.as_str());
                 }
             }
 
@@ -156,15 +165,16 @@ pub async fn run(cli: Cli) -> Result<()> {
 struct RuntimeConfig {
     project_name: String,
     server: String,
-    token: String,
+    /// A credential, so it is wiped when the runtime configuration is dropped.
+    token: Password,
     /// The password already resolved to decrypt `.keyben.toml`, when that file was read.
-    password: Option<String>,
+    password: Option<Password>,
 }
 
 impl RuntimeConfig {
     /// One password unlocks both `.keyben.toml` and the project itself, so reuse the value
     /// already resolved for the file rather than prompting a second time.
-    fn project_password(&self, from_args: &Option<String>) -> Result<String> {
+    fn project_password(&self, from_args: &Option<Password>) -> Result<Password> {
         match &self.password {
             Some(password) => Ok(password.clone()),
             None => resolve_password(from_args),
@@ -210,6 +220,7 @@ fn resolve_runtime(cli: &Cli, project_arg: Option<&str>) -> Result<RuntimeConfig
     let token = cli
         .token
         .clone()
+        .map(Zeroizing::new)
         .or_else(|| file_config.as_ref().map(|c| c.token.clone()));
     let server = server
         .filter(|s| !s.trim().is_empty())
@@ -272,7 +283,7 @@ async fn run_config_command(action: &ConfigCommand, cli: &Cli) -> Result<()> {
                 &Config {
                     project_name,
                     server,
-                    token,
+                    token: Zeroizing::new(token),
                 },
                 &password,
             )?;
@@ -290,7 +301,7 @@ fn prompt_text(prompt: &str) -> Option<String> {
 }
 
 /// Resolve the password from an argument or environment variable, otherwise prompt securely.
-fn resolve_password(from_args: &Option<String>) -> Result<String> {
+fn resolve_password(from_args: &Option<Password>) -> Result<Password> {
     if let Some(password) = from_args {
         if password.is_empty() {
             bail!("Project password cannot be empty");
@@ -301,6 +312,7 @@ fn resolve_password(from_args: &Option<String>) -> Result<String> {
     dialoguer::Password::new()
         .with_prompt("Enter the project password")
         .interact()
+        .map(Zeroizing::new)
         .context("Failed to read password (use --password or KEYBEN_PASSWORD in non-interactive environments)")
 }
 
@@ -318,19 +330,24 @@ fn resolve_secret_name(from_args: &Option<String>) -> Result<String> {
     Ok(name)
 }
 
-fn resolve_secret_value(from_args: &Option<String>) -> Result<String> {
+fn resolve_secret_value(from_args: &Option<String>) -> Result<crypto::SecretText> {
     if let Some(value) = from_args {
-        return Ok(value.clone());
+        return Ok(Zeroizing::new(value.clone()));
     }
 
     dialoguer::Password::new()
         .with_prompt("Enter the secret value")
         .allow_empty_password(true)
         .interact()
+        .map(Zeroizing::new)
         .context("Failed to read secret value (use --value in non-interactive environments)")
 }
 
-fn resolve_new_password(from_args: Option<&String>, prompt: &str, usage: &str) -> Result<String> {
+fn resolve_new_password(
+    from_args: Option<&Password>,
+    prompt: &str,
+    usage: &str,
+) -> Result<Password> {
     if let Some(password) = from_args {
         if password.is_empty() {
             bail!("Project password cannot be empty");
@@ -345,6 +362,7 @@ fn resolve_new_password(from_args: Option<&String>, prompt: &str, usage: &str) -
             "Project passwords do not match",
         )
         .interact()
+        .map(Zeroizing::new)
         .with_context(|| format!("Failed to read project password ({usage})"))
 }
 
@@ -360,14 +378,14 @@ async fn reset_project_password(
     api: &Api,
     project: &str,
     old_password: &str,
-    new_password_args: Option<&String>,
+    new_password_args: Option<&Password>,
 ) -> Result<()> {
     let new_password = resolve_new_password(
         new_password_args,
         "Enter the new project password",
         "use --new-password or KEYBEN_NEW_PASSWORD in non-interactive environments",
     )?;
-    if old_password == new_password {
+    if old_password == new_password.as_str() {
         bail!("New project password must differ from the current password");
     }
 
@@ -406,10 +424,12 @@ const CREDENTIAL_ENV_VARS: [&str; 4] = [
 fn build_child_command(
     program: &str,
     args: &[String],
-    secrets: &BTreeMap<String, String>,
+    secrets: &BTreeMap<String, crypto::SecretText>,
 ) -> ProcessCommand {
     let mut command = ProcessCommand::new(program);
-    command.args(args).envs(secrets);
+    command
+        .args(args)
+        .envs(secrets.iter().map(|(name, value)| (name, value.as_str())));
     // Strip inherited credentials, but never a variable the project itself defines under one
     // of these names: an explicit secret wins over the ambient value.
     for name in CREDENTIAL_ENV_VARS {
@@ -421,7 +441,7 @@ fn build_child_command(
 }
 
 /// Inject decrypted environment variables, launch the child process unchanged, and propagate its exit code.
-fn exec(argv: &[String], secrets: BTreeMap<String, String>) -> Result<()> {
+fn exec(argv: &[String], secrets: BTreeMap<String, crypto::SecretText>) -> Result<()> {
     let (program, args) = argv
         .split_first()
         .context("A program to execute must be provided after `--`")?;
@@ -429,6 +449,10 @@ fn exec(argv: &[String], secrets: BTreeMap<String, String>) -> Result<()> {
     let status = build_child_command(program, args, &secrets)
         .status()
         .with_context(|| format!("Failed to execute `{program}`"))?;
+
+    // `process::exit` below runs no destructors, so wipe the decrypted values by hand first.
+    // The child already holds its own copy in its environment.
+    drop(secrets);
 
     // When a signal terminates the child (status.code() is None), conventionally
     // return 128 + the signal number.
@@ -452,7 +476,8 @@ fn exec(argv: &[String], secrets: BTreeMap<String, String>) -> Result<()> {
 struct Api {
     http: reqwest::Client,
     base: String,
-    token: String,
+    /// A credential, so it is wiped when the client is dropped.
+    token: Password,
 }
 
 impl Api {
@@ -464,11 +489,13 @@ impl Api {
             .trim_end_matches('/')
             .to_owned();
 
-        let token = token
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .context("Missing authentication token; use --token or set KEYBEN_TOKEN")?
-            .to_owned();
+        let token = Zeroizing::new(
+            token
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .context("Missing authentication token; use --token or set KEYBEN_TOKEN")?
+                .to_owned(),
+        );
 
         let http = reqwest::Client::builder()
             .danger_accept_invalid_certs(insecure)
@@ -492,7 +519,7 @@ impl Api {
     /// Send a request and translate non-2xx status codes into readable errors.
     async fn send(&self, request: RequestBuilder) -> Result<Response> {
         let response = request
-            .bearer_auth(&self.token)
+            .bearer_auth(self.token.as_str())
             .send()
             .await
             .with_context(|| format!("Request to server failed: {}", self.base))?;
@@ -643,12 +670,14 @@ impl Api {
     }
 
     /// Fetch and decrypt all variables in an environment.
+    ///
+    /// Every value is wrapped, so the whole map wipes itself when the caller drops it.
     async fn fetch_all(
         &self,
         project: &str,
         env: Env,
         session: &ProjectSession,
-    ) -> Result<BTreeMap<String, String>> {
+    ) -> Result<BTreeMap<String, crypto::SecretText>> {
         let entries = self.fetch_encrypted(project, env, session).await?;
 
         entries
@@ -726,7 +755,10 @@ mod tests {
     /// would otherwise expose the project password and the server token.
     #[test]
     fn child_process_does_not_inherit_keyben_credentials() {
-        let secrets = BTreeMap::from([("DB_URL".to_owned(), "postgres://x".to_owned())]);
+        let secrets = BTreeMap::from([(
+            "DB_URL".to_owned(),
+            Zeroizing::new("postgres://x".to_owned()),
+        )]);
         let command = build_child_command("sh", &[], &secrets);
 
         for name in CREDENTIAL_ENV_VARS {
@@ -749,7 +781,10 @@ mod tests {
     /// stripped along with the ambient value.
     #[test]
     fn an_explicit_secret_overrides_the_inherited_credential() {
-        let secrets = BTreeMap::from([("KEYBEN_TOKEN".to_owned(), "from-project".to_owned())]);
+        let secrets = BTreeMap::from([(
+            "KEYBEN_TOKEN".to_owned(),
+            Zeroizing::new("from-project".to_owned()),
+        )]);
         let args = ["-c".to_owned(), "printf '%s' \"$KEYBEN_TOKEN\"".to_owned()];
 
         assert_eq!(
