@@ -1,8 +1,9 @@
 //! Client: all encryption and decryption happen here; the server only sends and receives Base64 ciphertext.
 
 use anyhow::{Context, Result, bail};
+use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use reqwest::{RequestBuilder, Response, StatusCode};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::json;
 use std::{collections::BTreeMap, process::Command as ProcessCommand, time::Duration};
 
@@ -23,12 +24,18 @@ struct SecretEntry {
     value: String,
 }
 
-#[derive(Debug, Serialize)]
-struct PasswordResetSecret {
-    env: String,
-    name: String,
-    old_value: String,
-    new_value: String,
+/// Public per-project metadata the client fetches before deriving keys.
+#[derive(Debug, Deserialize)]
+struct ProjectMeta {
+    salt: String,
+    wrapped_dek: String,
+}
+
+/// An unlocked project: the password-derived keys plus the unwrapped DEK, ready to
+/// authenticate requests and encrypt or decrypt secrets.
+struct ProjectSession {
+    keys: crypto::ProjectKeys,
+    dek: [u8; 32],
 }
 
 /// Execute a subcommand in client mode.
@@ -67,9 +74,16 @@ pub async fn run(cli: Cli) -> Result<()> {
                 let password = resolve_password(&cli.password)?;
                 let name = resolve_secret_name(name)?;
                 let value = resolve_secret_value(value)?;
-                let blob = crypto::encrypt(&password, &value)?;
                 let project_name = project_name.as_deref().unwrap_or(&runtime.project_name);
-                api.set_secret(project_name, *env, &name, &blob, &password)
+                let session = api.unlock(project_name, &password).await?;
+                let blob = crypto::encrypt_secret(
+                    &session.dek,
+                    project_name,
+                    env.as_str(),
+                    &name,
+                    &value,
+                )?;
+                api.set_secret(project_name, *env, &name, &blob, &session)
                     .await?;
                 println!("Set {name} in {project_name}/{}", env.as_str());
             }
@@ -81,8 +95,12 @@ pub async fn run(cli: Cli) -> Result<()> {
             } => {
                 let password = resolve_password(&cli.password)?;
                 let project_name = project_name.as_deref().unwrap_or(&runtime.project_name);
-                let blob = api.get_secret(project_name, *env, name, &password).await?;
-                println!("{}", crypto::decrypt(&password, &blob)?);
+                let session = api.unlock(project_name, &password).await?;
+                let blob = api.get_secret(project_name, *env, name, &session).await?;
+                println!(
+                    "{}",
+                    crypto::decrypt_secret(&session.dek, project_name, env.as_str(), name, &blob)?
+                );
             }
 
             SecretsCommand::Get {
@@ -92,7 +110,8 @@ pub async fn run(cli: Cli) -> Result<()> {
             } => {
                 let password = resolve_password(&cli.password)?;
                 let project_name = project_name.as_deref().unwrap_or(&runtime.project_name);
-                for (name, value) in api.fetch_all(project_name, *env, &password).await? {
+                let session = api.unlock(project_name, &password).await?;
+                for (name, value) in api.fetch_all(project_name, *env, &session).await? {
                     println!("{name}={value}");
                 }
             }
@@ -104,7 +123,8 @@ pub async fn run(cli: Cli) -> Result<()> {
             } => {
                 let password = resolve_password(&cli.password)?;
                 let project_name = project_name.as_deref().unwrap_or(&runtime.project_name);
-                api.delete_secret(project_name, *env, name, &password)
+                let session = api.unlock(project_name, &password).await?;
+                api.delete_secret(project_name, *env, name, &session)
                     .await?;
                 println!("Deleted {name} from {project_name}/{}", env.as_str());
             }
@@ -129,7 +149,8 @@ pub async fn run(cli: Cli) -> Result<()> {
         } => {
             let password = resolve_password(&cli.password)?;
             let project_name = project_name.as_deref().unwrap_or(&runtime.project_name);
-            let secrets = api.fetch_all(project_name, *env, &password).await?;
+            let session = api.unlock(project_name, &password).await?;
+            let secrets = api.fetch_all(project_name, *env, &session).await?;
             exec(argv, secrets)?;
         }
         Command::Config { .. } => {
@@ -317,6 +338,14 @@ fn resolve_new_password(from_args: Option<&String>, prompt: &str, usage: &str) -
         .with_context(|| format!("Failed to read project password ({usage})"))
 }
 
+/// Decode a Base64 salt from the server and derive the per-project keys from a password.
+fn derive_keys(project: &str, password: &str, salt_b64: &str) -> Result<crypto::ProjectKeys> {
+    let salt = B64
+        .decode(salt_b64.trim())
+        .with_context(|| format!("Project `{project}` returned an invalid salt"))?;
+    crypto::derive_project_keys(password, &salt)
+}
+
 async fn reset_project_password(
     api: &Api,
     project: &str,
@@ -333,28 +362,25 @@ async fn reset_project_password(
         bail!("New project password must differ from the current password");
     }
 
-    let mut secrets = Vec::new();
-    for env in [Env::Dev, Env::Prod] {
-        for entry in api.fetch_encrypted(project, env, &old_password).await? {
-            let plaintext = crypto::decrypt(&old_password, &entry.value).with_context(|| {
-                format!(
-                    "Failed to decrypt variable `{}` in {}/{}",
-                    entry.name,
-                    project,
-                    env.as_str()
-                )
-            })?;
-            secrets.push(PasswordResetSecret {
-                env: env.as_str().to_owned(),
-                name: entry.name,
-                old_value: entry.value,
-                new_value: crypto::encrypt(&new_password, &plaintext)?,
-            });
-        }
-    }
+    // Unlock the project with the old password to recover the DEK, then re-wrap the *same*
+    // DEK under a fresh salt and new password. Secret ciphertext is never touched.
+    let meta = api.fetch_meta(project).await?;
+    let old_keys = derive_keys(project, &old_password, &meta.salt)?;
+    let dek = crypto::unwrap_dek(&old_keys, &meta.wrapped_dek, project)
+        .context("Failed to unlock the project with the current password")?;
 
-    api.reset_project_password(project, &old_password, &new_password, &secrets)
-        .await
+    let new_salt = crypto::generate_salt();
+    let new_keys = crypto::derive_project_keys(&new_password, &new_salt)?;
+    let new_wrapped_dek = crypto::wrap_dek(&new_keys, &dek, project)?;
+
+    api.reset_project_password(
+        project,
+        &old_keys,
+        &B64.encode(new_salt),
+        &new_wrapped_dek,
+        &new_keys.auth_hash_b64(),
+    )
+    .await
 }
 
 /// Inject decrypted environment variables, launch the child process unchanged, and propagate its exit code.
@@ -459,22 +485,51 @@ impl Api {
         bail!("Server returned {status}: {detail}");
     }
 
+    /// Create a project: generate a fresh salt and DEK, wrap the DEK under the password-derived
+    /// key, and send only public envelope metadata to the server.
     async fn create_project(&self, project: &str, password: &str) -> Result<()> {
+        let salt = crypto::generate_salt();
+        let keys = crypto::derive_project_keys(password, &salt)?;
+        let dek = crypto::generate_dek();
+        let wrapped_dek = crypto::wrap_dek(&keys, &dek, project)?;
+
         let url = format!("{}/api/projects", self.base);
         self.send(self.http.post(url).json(&json!({
             "name": project,
-            "password_hash": crypto::project_password_hash(project, password)
+            "salt": B64.encode(salt),
+            "wrapped_dek": wrapped_dek,
+            "auth_hash": keys.auth_hash_b64(),
         })))
         .await?;
         Ok(())
     }
 
+    /// Fetch the public metadata (salt + wrapped DEK) needed to derive keys. Bearer-only.
+    async fn fetch_meta(&self, project: &str) -> Result<ProjectMeta> {
+        let url = self.url(&[project, "meta"]);
+        self.send(self.http.get(url))
+            .await?
+            .json()
+            .await
+            .context("Failed to parse project metadata from server")
+    }
+
+    /// Unlock a project: fetch its metadata, derive keys from the password, and unwrap the DEK.
+    async fn unlock(&self, project: &str, password: &str) -> Result<ProjectSession> {
+        let meta = self.fetch_meta(project).await?;
+        let keys = derive_keys(project, password, &meta.salt)?;
+        let dek = crypto::unwrap_dek(&keys, &meta.wrapped_dek, project)
+            .context("Failed to unlock the project; incorrect password")?;
+        Ok(ProjectSession { keys, dek })
+    }
+
     async fn reset_project_password(
         &self,
         project: &str,
-        old_password: &str,
-        new_password: &str,
-        secrets: &[PasswordResetSecret],
+        old_keys: &crypto::ProjectKeys,
+        new_salt: &str,
+        new_wrapped_dek: &str,
+        new_auth_hash: &str,
     ) -> Result<()> {
         let url = format!(
             "{}/api/project-passwords/{}",
@@ -484,13 +539,11 @@ impl Api {
         self.send(
             self.http
                 .post(url)
-                .header(
-                    PROJECT_PASSWORD_HEADER,
-                    crypto::project_password_hash(project, old_password),
-                )
+                .header(PROJECT_AUTH_HEADER, old_keys.auth_secret_b64())
                 .json(&json!({
-                    "password_hash": crypto::project_password_hash(project, new_password),
-                    "secrets": secrets,
+                    "salt": new_salt,
+                    "wrapped_dek": new_wrapped_dek,
+                    "auth_hash": new_auth_hash,
                 })),
         )
         .await?;
@@ -503,16 +556,13 @@ impl Api {
         env: Env,
         name: &str,
         blob: &str,
-        password: &str,
+        session: &ProjectSession,
     ) -> Result<()> {
         let url = self.url(&[project, env.as_str(), name]);
         self.send(
             self.http
                 .put(url)
-                .header(
-                    PROJECT_PASSWORD_HEADER,
-                    crypto::project_password_hash(project, password),
-                )
+                .header(PROJECT_AUTH_HEADER, session.keys.auth_secret_b64())
                 .json(&json!({ "value": blob })),
         )
         .await?;
@@ -524,14 +574,15 @@ impl Api {
         project: &str,
         env: Env,
         name: &str,
-        password: &str,
+        session: &ProjectSession,
     ) -> Result<String> {
         let url = self.url(&[project, env.as_str(), name]);
         let payload: SecretValue = self
-            .send(self.http.get(url).header(
-                PROJECT_PASSWORD_HEADER,
-                crypto::project_password_hash(project, password),
-            ))
+            .send(
+                self.http
+                    .get(url)
+                    .header(PROJECT_AUTH_HEADER, session.keys.auth_secret_b64()),
+            )
             .await?
             .json()
             .await
@@ -544,13 +595,14 @@ impl Api {
         project: &str,
         env: Env,
         name: &str,
-        password: &str,
+        session: &ProjectSession,
     ) -> Result<()> {
         let url = self.url(&[project, env.as_str(), name]);
-        self.send(self.http.delete(url).header(
-            PROJECT_PASSWORD_HEADER,
-            crypto::project_password_hash(project, password),
-        ))
+        self.send(
+            self.http
+                .delete(url)
+                .header(PROJECT_AUTH_HEADER, session.keys.auth_secret_b64()),
+        )
         .await?;
         Ok(())
     }
@@ -560,15 +612,21 @@ impl Api {
         &self,
         project: &str,
         env: Env,
-        password: &str,
+        session: &ProjectSession,
     ) -> Result<BTreeMap<String, String>> {
-        let entries = self.fetch_encrypted(project, env, password).await?;
+        let entries = self.fetch_encrypted(project, env, session).await?;
 
         entries
             .into_iter()
             .map(|entry| {
-                let value = crypto::decrypt(password, &entry.value)
-                    .with_context(|| format!("Failed to decrypt variable `{}`", entry.name))?;
+                let value = crypto::decrypt_secret(
+                    &session.dek,
+                    project,
+                    env.as_str(),
+                    &entry.name,
+                    &entry.value,
+                )
+                .with_context(|| format!("Failed to decrypt variable `{}`", entry.name))?;
                 Ok((entry.name, value))
             })
             .collect()
@@ -578,13 +636,14 @@ impl Api {
         &self,
         project: &str,
         env: Env,
-        password: &str,
+        session: &ProjectSession,
     ) -> Result<Vec<SecretEntry>> {
         let url = self.url(&[project, env.as_str()]);
-        self.send(self.http.get(url).header(
-            PROJECT_PASSWORD_HEADER,
-            crypto::project_password_hash(project, password),
-        ))
+        self.send(
+            self.http
+                .get(url)
+                .header(PROJECT_AUTH_HEADER, session.keys.auth_secret_b64()),
+        )
         .await?
         .json()
         .await
@@ -606,7 +665,7 @@ fn percent_encode(segment: &str) -> String {
     encoded
 }
 
-const PROJECT_PASSWORD_HEADER: &str = "x-keyben-project-password";
+const PROJECT_AUTH_HEADER: &str = "x-keyben-project-auth";
 
 #[cfg(test)]
 mod tests {

@@ -7,26 +7,26 @@ use sqlx::{
 };
 use std::path::Path;
 
+/// Public per-project metadata a client needs before it can derive keys.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PasswordResetSecret {
-    pub env: String,
-    pub name: String,
-    pub old_value: String,
-    pub new_value: String,
+pub struct ProjectMeta {
+    pub salt: String,
+    pub wrapped_dek: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PasswordResetResult {
     Updated,
     PasswordMismatch,
-    SecretsChanged,
 }
 
 /// Schema containing only the `projects` and `secrets` tables.
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS projects (
-    name TEXT NOT NULL PRIMARY KEY,
-    password_hash TEXT NOT NULL
+    name         TEXT NOT NULL PRIMARY KEY,
+    salt         TEXT NOT NULL,
+    wrapped_dek  TEXT NOT NULL,
+    auth_hash    TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS secrets (
@@ -71,92 +71,74 @@ impl Db {
         Ok(Self { pool })
     }
 
-    /// Create a project; using the same password hash again is idempotent.
+    /// Create a project. Returns `false` if a project with this name already exists.
     pub async fn create_project(
         &self,
         name: &str,
-        password_hash: &str,
+        salt: &str,
+        wrapped_dek: &str,
+        auth_hash: &str,
     ) -> Result<bool, sqlx::Error> {
         let result = sqlx::query(
-            "INSERT INTO projects (name, password_hash) VALUES (?, ?)
-             ON CONFLICT(name) DO UPDATE SET password_hash = excluded.password_hash
-             WHERE projects.password_hash = excluded.password_hash",
+            "INSERT INTO projects (name, salt, wrapped_dek, auth_hash) VALUES (?, ?, ?, ?)
+             ON CONFLICT(name) DO NOTHING",
         )
         .bind(name)
-        .bind(password_hash)
+        .bind(salt)
+        .bind(wrapped_dek)
+        .bind(auth_hash)
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() > 0)
     }
 
-    pub async fn project_password_hash(&self, name: &str) -> Result<Option<String>, sqlx::Error> {
-        sqlx::query_scalar("SELECT password_hash FROM projects WHERE name = ?")
+    /// Fetch the public metadata (salt + wrapped DEK) a client needs to derive keys.
+    pub async fn project_meta(&self, name: &str) -> Result<Option<ProjectMeta>, sqlx::Error> {
+        let row = sqlx::query("SELECT salt, wrapped_dek FROM projects WHERE name = ?")
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|row| ProjectMeta {
+            salt: row.get("salt"),
+            wrapped_dek: row.get("wrapped_dek"),
+        }))
+    }
+
+    pub async fn project_auth_hash(&self, name: &str) -> Result<Option<String>, sqlx::Error> {
+        sqlx::query_scalar("SELECT auth_hash FROM projects WHERE name = ?")
             .bind(name)
             .fetch_optional(&self.pool)
             .await
     }
 
+    /// Replace a project's salt, wrapped DEK, and auth hash in one statement, gated on the
+    /// current auth hash. The secret ciphertext is untouched because the DEK is unchanged.
     pub async fn reset_password(
         &self,
         project: &str,
-        old_password_hash: &str,
-        new_password_hash: &str,
-        secrets: &[PasswordResetSecret],
+        old_auth_hash: &str,
+        new_salt: &str,
+        new_wrapped_dek: &str,
+        new_auth_hash: &str,
     ) -> Result<PasswordResetResult, sqlx::Error> {
-        let mut expected_secrets = secrets.to_vec();
-        expected_secrets
-            .sort_by(|left, right| (&left.env, &left.name).cmp(&(&right.env, &right.name)));
-
-        let mut transaction = self.pool.begin().await?;
         let updated = sqlx::query(
-            "UPDATE projects SET password_hash = ?
-             WHERE name = ? AND password_hash = ?",
+            "UPDATE projects SET salt = ?, wrapped_dek = ?, auth_hash = ?
+             WHERE name = ? AND auth_hash = ?",
         )
-        .bind(new_password_hash)
+        .bind(new_salt)
+        .bind(new_wrapped_dek)
+        .bind(new_auth_hash)
         .bind(project)
-        .bind(old_password_hash)
-        .execute(&mut *transaction)
+        .bind(old_auth_hash)
+        .execute(&self.pool)
         .await?
         .rows_affected();
+
         if updated == 0 {
-            transaction.rollback().await?;
-            return Ok(PasswordResetResult::PasswordMismatch);
+            Ok(PasswordResetResult::PasswordMismatch)
+        } else {
+            Ok(PasswordResetResult::Updated)
         }
-
-        let current_secrets: Vec<(String, String, String)> = sqlx::query_as(
-            "SELECT env, name, value FROM secrets
-             WHERE project_name = ? ORDER BY env, name",
-        )
-        .bind(project)
-        .fetch_all(&mut *transaction)
-        .await?;
-
-        let snapshot_matches = current_secrets.len() == expected_secrets.len()
-            && current_secrets.iter().zip(&expected_secrets).all(
-                |((env, name, value), expected)| {
-                    env == &expected.env && name == &expected.name && value == &expected.old_value
-                },
-            );
-        if !snapshot_matches {
-            transaction.rollback().await?;
-            return Ok(PasswordResetResult::SecretsChanged);
-        }
-
-        for secret in &expected_secrets {
-            sqlx::query(
-                "UPDATE secrets SET value = ?
-                 WHERE project_name = ? AND env = ? AND name = ?",
-            )
-            .bind(&secret.new_value)
-            .bind(project)
-            .bind(&secret.env)
-            .bind(&secret.name)
-            .execute(&mut *transaction)
-            .await?;
-        }
-
-        transaction.commit().await?;
-        Ok(PasswordResetResult::Updated)
     }
 
     /// Write or overwrite a variable whose value is Base64 ciphertext from the client.
@@ -187,13 +169,13 @@ impl Db {
         env: &str,
         name: &str,
         value: &str,
-        password_hash: &str,
+        auth_hash: &str,
     ) -> Result<bool, sqlx::Error> {
         let result = sqlx::query(
             "INSERT INTO secrets (project_name, env, name, value)
              SELECT ?, ?, ?, ?
              WHERE EXISTS (
-                 SELECT 1 FROM projects WHERE name = ? AND password_hash = ?
+                 SELECT 1 FROM projects WHERE name = ? AND auth_hash = ?
              )
              ON CONFLICT (project_name, env, name) DO UPDATE SET value = excluded.value",
         )
@@ -202,7 +184,7 @@ impl Db {
         .bind(name)
         .bind(value)
         .bind(project)
-        .bind(password_hash)
+        .bind(auth_hash)
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() > 0)
@@ -248,20 +230,20 @@ impl Db {
         project: &str,
         env: &str,
         name: &str,
-        password_hash: &str,
+        auth_hash: &str,
     ) -> Result<bool, sqlx::Error> {
         let result = sqlx::query(
             "DELETE FROM secrets
              WHERE project_name = ? AND env = ? AND name = ?
                AND EXISTS (
-                   SELECT 1 FROM projects WHERE projects.name = ? AND password_hash = ?
+                   SELECT 1 FROM projects WHERE projects.name = ? AND auth_hash = ?
                )",
         )
         .bind(project)
         .bind(env)
         .bind(name)
         .bind(project)
-        .bind(password_hash)
+        .bind(auth_hash)
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() > 0)
@@ -277,16 +259,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn project_password_is_idempotent_but_cannot_be_changed() {
+    async fn create_project_is_exclusive_once_a_name_is_taken() {
         let path = test_db_path();
         let db = Db::open(&path).await.unwrap();
 
-        assert!(db.create_project("app", "hash-one").await.unwrap());
-        assert!(db.create_project("app", "hash-one").await.unwrap());
-        assert!(!db.create_project("app", "hash-two").await.unwrap());
+        assert!(
+            db.create_project("app", "salt-1", "dek-1", "auth-1")
+                .await
+                .unwrap()
+        );
+        // A second create for the same name is rejected, even with identical values.
+        assert!(
+            !db.create_project("app", "salt-1", "dek-1", "auth-1")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !db.create_project("app", "salt-2", "dek-2", "auth-2")
+                .await
+                .unwrap()
+        );
         assert_eq!(
-            db.project_password_hash("app").await.unwrap().as_deref(),
-            Some("hash-one")
+            db.project_meta("app").await.unwrap(),
+            Some(ProjectMeta {
+                salt: "salt-1".to_owned(),
+                wrapped_dek: "dek-1".to_owned(),
+            })
+        );
+        assert_eq!(
+            db.project_auth_hash("app").await.unwrap().as_deref(),
+            Some("auth-1")
         );
 
         db.pool.close().await;
@@ -294,44 +296,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn password_reset_replaces_all_ciphertexts_atomically() {
+    async fn password_reset_rewraps_dek_without_touching_secrets() {
         let path = test_db_path();
         let db = Db::open(&path).await.unwrap();
-        db.create_project("app", "old-hash").await.unwrap();
-        db.set_secret("app", "prod", "B", "old-prod").await.unwrap();
-        db.set_secret("app", "dev", "A", "old-dev").await.unwrap();
+        db.create_project("app", "old-salt", "old-dek", "old-auth")
+            .await
+            .unwrap();
+        db.set_secret("app", "prod", "B", "cipher-B").await.unwrap();
+        db.set_secret("app", "dev", "A", "cipher-A").await.unwrap();
 
-        let secrets = vec![
-            PasswordResetSecret {
-                env: "prod".to_owned(),
-                name: "B".to_owned(),
-                old_value: "old-prod".to_owned(),
-                new_value: "new-prod".to_owned(),
-            },
-            PasswordResetSecret {
-                env: "dev".to_owned(),
-                name: "A".to_owned(),
-                old_value: "old-dev".to_owned(),
-                new_value: "new-dev".to_owned(),
-            },
-        ];
         assert_eq!(
-            db.reset_password("app", "old-hash", "new-hash", &secrets)
+            db.reset_password("app", "old-auth", "new-salt", "new-dek", "new-auth")
                 .await
                 .unwrap(),
             PasswordResetResult::Updated
         );
         assert_eq!(
-            db.project_password_hash("app").await.unwrap().as_deref(),
-            Some("new-hash")
+            db.project_meta("app").await.unwrap(),
+            Some(ProjectMeta {
+                salt: "new-salt".to_owned(),
+                wrapped_dek: "new-dek".to_owned(),
+            })
         );
         assert_eq!(
+            db.project_auth_hash("app").await.unwrap().as_deref(),
+            Some("new-auth")
+        );
+        // Secret ciphertext is unchanged because the DEK itself did not change.
+        assert_eq!(
             db.list_secrets("app", "dev").await.unwrap(),
-            vec![("A".to_owned(), "new-dev".to_owned())]
+            vec![("A".to_owned(), "cipher-A".to_owned())]
         );
         assert_eq!(
             db.list_secrets("app", "prod").await.unwrap(),
-            vec![("B".to_owned(), "new-prod".to_owned())]
+            vec![("B".to_owned(), "cipher-B".to_owned())]
         );
 
         db.pool.close().await;
@@ -339,31 +337,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn password_reset_snapshot_mismatch_does_not_change_anything() {
+    async fn password_reset_with_wrong_auth_hash_changes_nothing() {
         let path = test_db_path();
         let db = Db::open(&path).await.unwrap();
-        db.create_project("app", "old-hash").await.unwrap();
-        db.set_secret("app", "dev", "A", "current").await.unwrap();
+        db.create_project("app", "old-salt", "old-dek", "old-auth")
+            .await
+            .unwrap();
+        db.set_secret("app", "dev", "A", "cipher-A").await.unwrap();
 
-        let secrets = vec![PasswordResetSecret {
-            env: "dev".to_owned(),
-            name: "A".to_owned(),
-            old_value: "stale".to_owned(),
-            new_value: "new-value".to_owned(),
-        }];
         assert_eq!(
-            db.reset_password("app", "old-hash", "new-hash", &secrets)
+            db.reset_password("app", "wrong-auth", "new-salt", "new-dek", "new-auth")
                 .await
                 .unwrap(),
-            PasswordResetResult::SecretsChanged
+            PasswordResetResult::PasswordMismatch
         );
         assert_eq!(
-            db.project_password_hash("app").await.unwrap().as_deref(),
-            Some("old-hash")
+            db.project_meta("app").await.unwrap(),
+            Some(ProjectMeta {
+                salt: "old-salt".to_owned(),
+                wrapped_dek: "old-dek".to_owned(),
+            })
         );
         assert_eq!(
-            db.get_secret("app", "dev", "A").await.unwrap().as_deref(),
-            Some("current")
+            db.project_auth_hash("app").await.unwrap().as_deref(),
+            Some("old-auth")
         );
 
         db.pool.close().await;

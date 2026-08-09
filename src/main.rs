@@ -3,7 +3,8 @@
 //! - `keyben -c <config.toml>`: run as the server for storage and Bearer Token authentication.
 //! - `keyben init | secrets | password | run`: run as the client for password-based encryption and decryption.
 //!
-//! The server never sees passwords or plaintext; the database contains password verification hashes and ChaCha20-Poly1305 ciphertext.
+//! The server never sees passwords or plaintext; the database holds only public envelope metadata
+//! (Argon2 salt, wrapped DEK, auth hash) and XChaCha20-Poly1305 ciphertext.
 
 mod cli;
 mod client;
