@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use zeroize::Zeroizing;
 
-use crate::crypto;
+use crate::common::{consts::CONFIG_FILE_NAME, crypto};
 
 /// Current on-disk format version. v2 derives the file key with Argon2id + a per-file salt.
 ///
@@ -43,7 +43,7 @@ pub struct Config {
 }
 
 pub fn path() -> Result<PathBuf> {
-    Ok(std::env::current_dir()?.join(".keyben.toml"))
+    Ok(std::env::current_dir()?.join(CONFIG_FILE_NAME))
 }
 
 pub fn exists() -> Result<bool> {
@@ -96,8 +96,8 @@ pub fn read(password: &str) -> Result<Config> {
         token,
     })
 }
-
-fn validate(project_name: &str, server: &str, token: &str) -> Result<()> {
+/// Reject values that could never reach the server or would encrypt into nonsense.
+pub fn validate(project_name: &str, server: &str, token: &str) -> Result<()> {
     if project_name.trim().is_empty() {
         bail!("Project name cannot be empty");
     }
@@ -108,10 +108,6 @@ fn validate(project_name: &str, server: &str, token: &str) -> Result<()> {
         bail!("Authentication token cannot be empty");
     }
     Ok(())
-}
-
-pub fn validate_values(project_name: &str, server: &str, token: &str) -> Result<()> {
-    validate(project_name, server, token)
 }
 
 #[cfg(test)]
@@ -146,5 +142,14 @@ mod tests {
             crypto::config_decrypt(&parsed_key, TOKEN_ROLE, &parsed.encrypted_token).unwrap(),
             value.token
         );
+    }
+
+    #[test]
+    fn validate_rejects_blank_fields() {
+        assert!(validate("app", "https://example.com", "token").is_ok());
+        // Whitespace-only counts as blank: it would be trimmed away before use.
+        assert!(validate("  ", "https://example.com", "token").is_err());
+        assert!(validate("app", "", "token").is_err());
+        assert!(validate("app", "https://example.com", " ").is_err());
     }
 }

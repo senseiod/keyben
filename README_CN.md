@@ -200,7 +200,7 @@ export KEYBEN_SERVER="https://secrets.example.com"
 export KEYBEN_TOKEN="服务端 config.toml 里的 auth_token"
 export KEYBEN_PASSWORD="项目对应的密码"
 
-# 1. 创建项目
+# 1. 创建项目（省略任何参数，keyben 都会交互式询问）
 keyben init --projectName myapp
 
 # 2. 写入一个密钥
@@ -219,6 +219,7 @@ keyben run --projectName myapp --env dev -- npm run dev
 # 其他
 
 # 在你的项目中创建一个.keyben.toml. 下次就无需输入--projectName --token --server
+# 写入之前会先到服务端校验这些值
 keyben config init 
 ```
 
@@ -227,7 +228,7 @@ keyben config init
 | 命令 | 作用 |
 | --- | --- |
 | `keyben init` | 在服务端创建项目并设置密码 |
-| `keyben config init` | 生成项目本地的加密配置文件 `.keyben.toml` |
+| `keyben config init` | 到服务端校验所有值，通过后生成项目本地的加密配置文件 `.keyben.toml` |
 | `keyben secrets set` | 加密并写入一个变量 |
 | `keyben secrets get` | 读取并解密一个变量，或整个环境 |
 | `keyben secrets delete` | 删除一个变量 |
@@ -235,6 +236,26 @@ keyben config init
 | `keyben run -- <cmd>` | 注入解密后的环境变量并启动子进程 |
 
 全局选项：`--server` / `--token` / `--password` / `--insecure`，分别对应环境变量 `KEYBEN_SERVER`、`KEYBEN_TOKEN`、`KEYBEN_PASSWORD`、`KEYBEN_INSECURE`。
+
+### 所有参数都不是必填
+
+每条命令都可以不带任何参数直接运行。没有给出的值不会报错，而是逐项交互式询问，不必为了往下走去翻某个参数叫什么：
+
+```bash
+# 依次询问 server、token、项目名、密码
+keyben init
+
+# 依次询问项目名、环境、变量名、值
+keyben secrets set
+```
+
+环境从列表中选择而不是手输；密码和 token 以不回显的方式读取。已经给过的值 —— 命令行参数、`KEYBEN_*` 环境变量、或 `.keyben.toml` 里的 —— 不会再问一遍，所以自动化场景依然免交互。在没有终端可供交互时，错误信息会直接指出该用哪个参数、哪个环境变量。
+
+唯一的例外是 `keyben run`：`--` 之后的程序仍然必填，因为没有合理的方式去交互式地询问一整条命令行以及它的参数边界。
+
+```bash
+keyben run -- npm run dev   # 会询问项目名和环境
+```
 
 ### 项目本地配置
 
@@ -245,6 +266,17 @@ keyben config init
 ```
 
 省略的值会交互式询问。服务器地址和 token 用**项目密码**加密后写入 —— 只需要记一个密码。项目名保持明文，作为默认的项目标识。文件已存在时会先询问是否覆盖。
+
+写入之前，所有值都会先到服务端校验一遍。一次解锁请求同时验证下面四项，任何一项出错都在犯错的地方直接报出来，而不是拖到下一条命令：
+
+| 出错的地方 | 报错信息 |
+| --- | --- |
+| 服务端不可达或 URL 写错 | `Request to server failed: <url>` |
+| token 与服务端 `auth_token` 不匹配 | `Authentication failed (401)` |
+| 该服务端上没有这个项目 | ``Project `myapp` does not exist`` |
+| 项目密码不对 | `Failed to unlock the project; incorrect password` |
+
+校验不通过时，文件不会被创建也不会被修改，错误信息里会明确说明这一点。没有跳过校验的开关 —— 一个看起来没问题、实际存着错 token 的 `.keyben.toml`，正是这一步要避免的。
 
 之后在该目录下运行任何命令，keyben 问一次项目密码，同时用它解密配置文件和解锁项目。取值优先级：
 
@@ -267,10 +299,10 @@ keyben secrets set --projectName myapp --env dev \
 
 值在本地加密后才发出。`--env` 只接受 `dev` 或 `prod`。
 
-在交互式终端里 `--name` 和 `--value` 都可以省略，keyben 会提示输入变量名，并以不回显的方式读取值 —— **推荐用这种方式**，避免明文进入 shell 历史：
+在交互式终端里所有参数都可以省略，keyben 会询问用哪个环境、提示输入变量名，并以不回显的方式读取值 —— **推荐用这种方式**，避免明文进入 shell 历史：
 
 ```bash
-keyben secrets set --projectName myapp --env dev
+keyben secrets set
 ```
 
 **读取单个**
@@ -303,7 +335,7 @@ keyben run --projectName myapp --env prod -- ./server --port 8080
 
 `--` 之后的一切都是子命令及其参数。keyben 拉取并解密整个环境，启动子进程，并透传它的退出码。
 
-子进程继承调用者的环境，加上解密出的密钥，**减去 keyben 自己的凭据** —— `KEYBEN_TOKEN`、`KEYBEN_PASSWORD`、`KEYBEN_NEW_PASSWORD`、`KEYBEN_CONFIG_PASSWORD` 会被移除，避免一个打印环境变量的子进程把它们暴露出去。如果项目里确实存了同名的密钥，显式值优先，仍然会生效。
+子进程继承调用者的环境，加上解密出的密钥，**减去 keyben 自己的凭据**：所有以 `KEYBEN` 开头的变量都会被移除，避免一个打印环境变量的子进程把 token 或项目密码暴露出去。这是按前缀匹配而不是一份固定名单，所以后续版本新增的凭据不会悄悄开始泄露。如果项目里确实存了同名的密钥，显式值优先，仍然会生效。
 
 ### 更换项目密码
 

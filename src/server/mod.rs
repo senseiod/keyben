@@ -10,7 +10,6 @@ use axum::{
 };
 use axum_server::{Handle, tls_rustls::RustlsConfig};
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
-use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{net::SocketAddr, path::Path, time::Duration};
@@ -20,7 +19,13 @@ use tower_http::{
 };
 
 use config::Config;
-use db::{Db, PasswordResetResult, ProjectMeta};
+use db::{Db, PasswordResetResult};
+
+use crate::common::{
+    consts::PROJECT_AUTH_HEADER,
+    env::Env,
+    wire::{CreateProject, ProjectMeta, ResetProjectPassword, SecretEntry, SecretValue},
+};
 
 mod config;
 mod db;
@@ -159,42 +164,9 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 // ---------------------------------------------------------------- Request/response bodies
-
-#[derive(Debug, Deserialize)]
-struct CreateProject {
-    name: String,
-    salt: String,
-    wrapped_dek: String,
-    auth_hash: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ResetProjectPassword {
-    salt: String,
-    wrapped_dek: String,
-    auth_hash: String,
-}
-
-const PROJECT_AUTH_HEADER: &str = "x-keyben-project-auth";
-
-/// The value is always Base64 ciphertext encrypted by the client.
-#[derive(Debug, Deserialize, Serialize)]
-struct SecretValue {
-    value: String,
-}
-
-/// Public per-project metadata returned to any token-holder so the client can derive keys.
-#[derive(Debug, Serialize)]
-struct ProjectMetaResponse {
-    salt: String,
-    wrapped_dek: String,
-}
-
-#[derive(Debug, Serialize)]
-struct SecretEntry {
-    name: String,
-    value: String,
-}
+//
+// The bodies themselves live in `common::wire`, so the client and the server cannot drift
+// apart on a field name.
 
 // ------------------------------------------------------------------- Handlers
 
@@ -225,12 +197,10 @@ async fn create_project(
 async fn get_project_meta(
     State(db): State<Db>,
     AxumPath(project): AxumPath<String>,
-) -> Result<Json<ProjectMetaResponse>, ApiError> {
+) -> Result<Json<ProjectMeta>, ApiError> {
     let project = canonical_project(&project)?;
     match db.project_meta(project).await? {
-        Some(ProjectMeta { salt, wrapped_dek }) => {
-            Ok(Json(ProjectMetaResponse { salt, wrapped_dek }))
-        }
+        Some(meta) => Ok(Json(meta)),
         None => Err(ApiError::not_found(format!(
             "Project `{project}` does not exist"
         ))),
@@ -324,7 +294,8 @@ async fn get_secret(
     headers: HeaderMap,
 ) -> Result<Json<SecretValue>, ApiError> {
     let project = validate_project_and_env(&project, &env, Some(&name))?;
-    let _password_hash = authorize_project(&db, project, &headers).await?;
+    // The returned hash is unused here, but the call is this endpoint's authentication.
+    authorize_project(&db, project, &headers).await?;
     match db.get_secret(project, &env, &name).await? {
         Some(value) => Ok(Json(SecretValue { value })),
         None => Err(ApiError::not_found(format!(
@@ -339,7 +310,8 @@ async fn list_secrets(
     headers: HeaderMap,
 ) -> Result<Json<Vec<SecretEntry>>, ApiError> {
     let project = validate_project_and_env(&project, &env, None)?;
-    let _password_hash = authorize_project(&db, project, &headers).await?;
+    // The returned hash is unused here, but the call is this endpoint's authentication.
+    authorize_project(&db, project, &headers).await?;
 
     let secrets = db
         .list_secrets(project, &env)
@@ -364,7 +336,7 @@ async fn delete_secret(
     {
         Ok(StatusCode::NO_CONTENT)
     } else {
-        authorize_project(&db, project, &headers).await?;
+        // The password was already verified above, so the only remaining cause is a missing row.
         Err(ApiError::not_found(format!(
             "Secret `{name}` does not exist in {project}/{env}"
         )))
@@ -414,7 +386,8 @@ fn validate_project_and_env<'a>(
     name: Option<&str>,
 ) -> Result<&'a str, ApiError> {
     let project = canonical_project(project)?;
-    if !matches!(env, "dev" | "prod") {
+    // The accepted set is defined once, by the client-facing enum.
+    if Env::parse(env).is_none() {
         return Err(ApiError::bad_request("Environment must be 'dev' or 'prod'"));
     }
     if let Some(name) = name
@@ -483,7 +456,7 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto;
+    use crate::common::crypto;
 
     /// Build the project auth header a client would send from its derived keys.
     fn auth_headers(keys: &crypto::ProjectKeys) -> HeaderMap {

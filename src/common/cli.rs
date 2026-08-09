@@ -3,10 +3,17 @@
 //! The binary has two operating modes:
 //! - provide `-c/--config` to run as the server (`keyben-server`);
 //! - provide a subcommand (`init` / `secrets` / `password` / `run`) to run as the client.
+//!
+//! Every value the client needs is optional here. A missing one is not an error: the client
+//! prompts for it (see `client::prompt`), so any command can be started bare. The single
+//! exception is the program after `--` in `keyben run`, which clap still requires — there is
+//! no sensible way to prompt for a command line plus its argument boundaries.
 
-use clap::{ArgAction, Parser, Subcommand, ValueEnum, builder::BoolishValueParser};
+use clap::{ArgAction, Parser, Subcommand, builder::BoolishValueParser};
 use std::path::PathBuf;
 use zeroize::Zeroizing;
+
+use crate::common::env::Env;
 
 /// A password parsed from the command line or the environment, wiped from memory on drop.
 pub type Password = Zeroizing<String>;
@@ -39,19 +46,20 @@ pub struct Cli {
     #[arg(short = 'c', long = "config", value_name = "FILE")]
     pub config: Option<PathBuf>,
 
-    /// Server URL, for example http://127.0.0.1:8000.
+    /// Server URL, for example http://127.0.0.1:8000. Prompts when omitted.
     #[arg(long, global = true, env = "KEYBEN_SERVER", value_name = "URL")]
     pub server: Option<String>,
 
-    /// HTTP API authentication token.
+    /// HTTP API authentication token. Prompts when omitted.
     #[arg(
         long,
         global = true,
         env = "KEYBEN_TOKEN",
         value_name = "TOKEN",
-        hide_env_values = true
+        hide_env_values = true,
+        value_parser = wiped_on_drop
     )]
-    pub token: Option<String>,
+    pub token: Option<Password>,
 
     /// Project password; also decrypts `.keyben.toml`. Prompts securely when omitted.
     #[arg(
@@ -85,7 +93,7 @@ pub struct Cli {
 pub enum Command {
     /// Create a project on the server.
     Init {
-        /// Project name.
+        /// Project name; prompts interactively when omitted.
         #[arg(long = "projectName", value_name = "NAME")]
         project_name: Option<String>,
     },
@@ -110,13 +118,13 @@ pub enum Command {
 
     /// Inject decrypted environment variables and launch a child process.
     Run {
-        /// Project name.
+        /// Project name; prompts interactively when omitted.
         #[arg(long = "projectName", value_name = "NAME")]
         project_name: Option<String>,
 
-        /// Environment.
+        /// Environment; prompts interactively when omitted.
         #[arg(long, value_enum)]
-        env: Env,
+        env: Option<Env>,
 
         /// Program and arguments after `--`.
         #[arg(
@@ -133,13 +141,13 @@ pub enum Command {
 pub enum SecretsCommand {
     /// Encrypt and write an environment variable.
     Set {
-        /// Project name.
+        /// Project name; prompts interactively when omitted.
         #[arg(long = "projectName", value_name = "NAME")]
         project_name: Option<String>,
 
-        /// Environment.
+        /// Environment; prompts interactively when omitted.
         #[arg(long, value_enum)]
-        env: Env,
+        env: Option<Env>,
 
         /// Variable name; prompts interactively when omitted.
         #[arg(long, value_name = "KEY")]
@@ -152,13 +160,13 @@ pub enum SecretsCommand {
 
     /// Read and decrypt an environment variable; without --name, print all variables in the environment.
     Get {
-        /// Project name.
+        /// Project name; prompts interactively when omitted.
         #[arg(long = "projectName", value_name = "NAME")]
         project_name: Option<String>,
 
-        /// Environment.
+        /// Environment; prompts interactively when omitted.
         #[arg(long, value_enum)]
-        env: Env,
+        env: Option<Env>,
 
         /// Variable name; when omitted, print all variables one per line as KEY=VALUE.
         #[arg(long, value_name = "KEY")]
@@ -167,17 +175,17 @@ pub enum SecretsCommand {
 
     /// Delete an environment variable.
     Delete {
-        /// Project name.
+        /// Project name; prompts interactively when omitted.
         #[arg(long = "projectName", value_name = "NAME")]
         project_name: Option<String>,
 
-        /// Environment.
+        /// Environment; prompts interactively when omitted.
         #[arg(long, value_enum)]
-        env: Env,
+        env: Option<Env>,
 
-        /// Variable name.
+        /// Variable name; prompts interactively when omitted.
         #[arg(long, value_name = "KEY")]
-        name: String,
+        name: Option<String>,
     },
 }
 
@@ -195,7 +203,7 @@ pub enum ConfigCommand {
 pub enum PasswordCommand {
     /// Re-wrap the project data key under a new password; secrets are left untouched.
     Reset {
-        /// Project name.
+        /// Project name; prompts interactively when omitted.
         #[arg(long = "projectName", value_name = "NAME")]
         project_name: Option<String>,
 
@@ -209,23 +217,6 @@ pub enum PasswordCommand {
         )]
         new_password: Option<Password>,
     },
-}
-
-/// Environment identifier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-#[value(rename_all = "lower")]
-pub enum Env {
-    Dev,
-    Prod,
-}
-
-impl Env {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Env::Dev => "dev",
-            Env::Prod => "prod",
-        }
-    }
 }
 
 #[cfg(test)]
@@ -313,6 +304,33 @@ mod tests {
         assert_eq!(value, None);
     }
 
+    /// Every client-supplied value is optional, so a bare subcommand parses and the client is
+    /// free to prompt for what is missing.
+    #[test]
+    fn every_subcommand_parses_with_no_arguments() {
+        for argv in [
+            vec!["keyben", "init"],
+            vec!["keyben", "config", "init"],
+            vec!["keyben", "secrets", "set"],
+            vec!["keyben", "secrets", "get"],
+            vec!["keyben", "secrets", "delete"],
+            vec!["keyben", "password", "reset"],
+        ] {
+            assert!(
+                Cli::try_parse_from(&argv).is_ok(),
+                "{argv:?} should parse and prompt for the rest"
+            );
+        }
+    }
+
+    /// `run` is the exception: the program after `--` cannot be prompted for, so clap keeps it
+    /// required and reports the usage error itself.
+    #[test]
+    fn run_still_requires_a_command_after_the_separator() {
+        assert!(Cli::try_parse_from(["keyben", "run"]).is_err());
+        assert!(Cli::try_parse_from(["keyben", "run", "--", "sh", "-c", "true"]).is_ok());
+    }
+
     #[test]
     fn parses_config_init_with_optional_values() {
         let cli = Cli::try_parse_from([
@@ -329,7 +347,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(cli.server.as_deref(), Some("http://example.com"));
-        assert_eq!(cli.token.as_deref(), Some("123456"));
+        assert_eq!(cli.token.as_deref().map(String::as_str), Some("123456"));
         let Command::Config {
             action: ConfigCommand::Init { project_name },
         } = cli.command.unwrap()

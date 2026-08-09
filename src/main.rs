@@ -6,15 +6,13 @@
 //! The server never sees passwords or plaintext; the database holds only public envelope metadata
 //! (Argon2 salt, wrapped DEK, auth hash) and XChaCha20-Poly1305 ciphertext.
 
-mod cli;
 mod client;
-mod config;
-mod crypto;
+mod common;
 mod server;
 
 use anyhow::{Result, bail};
 use clap::{CommandFactory, Parser};
-use cli::Cli;
+use common::cli::Cli;
 
 #[tokio::main]
 async fn main() {

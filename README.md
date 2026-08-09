@@ -200,7 +200,7 @@ export KEYBEN_SERVER="https://secrets.example.com"
 export KEYBEN_TOKEN="the auth_token from the server's config.toml"
 export KEYBEN_PASSWORD="the project's password"
 
-# 1. Create a project
+# 1. Create a project (omit any flag and keyben asks for it)
 keyben init --projectName myapp
 
 # 2. Store a secret
@@ -218,7 +218,8 @@ keyben run --projectName myapp --env dev -- npm run dev
 
 # Extras
 
-# Create a .keyben.toml in your project so you can skip --projectName --token --server next time
+# Create a .keyben.toml in your project so you can skip --projectName --token --server next time.
+# The values are verified against the server before the file is written.
 keyben config init 
 ```
 
@@ -227,7 +228,7 @@ keyben config init
 | Command | What it does |
 | --- | --- |
 | `keyben init` | Create a project on the server and set its password |
-| `keyben config init` | Generate the project-local encrypted config file `.keyben.toml` |
+| `keyben config init` | Generate the project-local encrypted config file `.keyben.toml`, after verifying every value against the server |
 | `keyben secrets set` | Encrypt and store a variable |
 | `keyben secrets get` | Fetch and decrypt one variable, or a whole environment |
 | `keyben secrets delete` | Delete a variable |
@@ -235,6 +236,26 @@ keyben config init
 | `keyben run -- <cmd>` | Inject decrypted environment variables and launch a child process |
 
 Global options: `--server` / `--token` / `--password` / `--insecure`, matching the environment variables `KEYBEN_SERVER`, `KEYBEN_TOKEN`, `KEYBEN_PASSWORD`, and `KEYBEN_INSECURE`.
+
+### Nothing is required on the command line
+
+Every command can be started bare. A value you don't pass is asked for instead of rejected, so you never have to look up a flag name to make progress:
+
+```bash
+# Prompts for the server, token, project name, and password in turn
+keyben init
+
+# Prompts for the project name, environment, variable name, and value
+keyben secrets set
+```
+
+Environments are chosen from a list rather than typed, and passwords and tokens are read without echoing. Values already supplied — as flags, as `KEYBEN_*` environment variables, or from `.keyben.toml` — are never asked about again, so automation stays non-interactive. When there's no terminal to prompt on, the error names the flag and the environment variable that would have supplied the value.
+
+The one exception is `keyben run`: the program after `--` is still required, since there's no sensible way to prompt for a command line along with its argument boundaries.
+
+```bash
+keyben run -- npm run dev   # prompts for project name and environment
+```
 
 ### Project-local configuration
 
@@ -245,6 +266,17 @@ keyben config init
 ```
 
 Anything you omit is asked for interactively. The server address and token are encrypted with the **project password** before being written — so you only have to remember one password. The project name stays in plaintext and acts as the default project identifier. If the file already exists, you'll be asked before it's overwritten.
+
+Every value is checked against the server before anything is written. A single unlock attempt exercises all four at once, so each failure is reported where the mistake was made rather than on some later command:
+
+| What's wrong | What you see |
+| --- | --- |
+| Server unreachable or the URL is wrong | `Request to server failed: <url>` |
+| Token doesn't match the server's `auth_token` | `Authentication failed (401)` |
+| Project doesn't exist on that server | ``Project `myapp` does not exist`` |
+| Wrong project password | `Failed to unlock the project; incorrect password` |
+
+If verification fails, the file is not created or modified, and the error says so explicitly. There's no flag to skip the check — a `.keyben.toml` that looks right but holds a bad token is exactly the failure this prevents.
 
 From then on, any command run in that directory asks for the project password once and uses it to both decrypt the config file and unlock the project. Resolution order:
 
@@ -267,10 +299,10 @@ keyben secrets set --projectName myapp --env dev \
 
 The value is encrypted locally before it leaves your machine. `--env` accepts only `dev` or `prod`.
 
-In an interactive terminal both `--name` and `--value` can be omitted: keyben prompts for the variable name and reads the value without echoing it — **the recommended way**, since it keeps plaintext out of your shell history:
+In an interactive terminal every flag can be omitted: keyben asks which environment, prompts for the variable name, and reads the value without echoing it — **the recommended way**, since it keeps plaintext out of your shell history:
 
 ```bash
-keyben secrets set --projectName myapp --env dev
+keyben secrets set
 ```
 
 **Read a single value**
@@ -303,7 +335,7 @@ keyben run --projectName myapp --env prod -- ./server --port 8080
 
 Everything after `--` is the subcommand and its arguments. keyben fetches and decrypts the whole environment, launches the child process, and passes through its exit code.
 
-The child inherits the caller's environment plus the decrypted secrets, **minus keyben's own credentials** — `KEYBEN_TOKEN`, `KEYBEN_PASSWORD`, `KEYBEN_NEW_PASSWORD`, and `KEYBEN_CONFIG_PASSWORD` are removed so a child process that dumps its environment can't expose them. If your project genuinely stores a secret under one of those names, the explicit value wins and is still applied.
+The child inherits the caller's environment plus the decrypted secrets, **minus keyben's own credentials**: every variable whose name starts with `KEYBEN` is removed, so a child process that dumps its environment can't expose the token or the project password. It's a prefix rule rather than a fixed list, so a credential added in a later version can't quietly start leaking. If your project genuinely stores a secret under such a name, the explicit value wins and is still applied.
 
 ### Changing the project password
 

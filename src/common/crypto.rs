@@ -29,8 +29,8 @@ use hkdf::Hkdf;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
-/// Argon2 salt length in bytes (public, stored alongside the project).
-pub const SALT_LEN: usize = 16;
+/// Argon2 salt length in bytes (public data, stored alongside the project).
+const SALT_LEN: usize = 16;
 /// Symmetric key / DEK length in bytes.
 const KEY_LEN: usize = 32;
 /// XChaCha20-Poly1305 extended nonce length in bytes.

@@ -7,12 +7,9 @@ use sqlx::{
 };
 use std::path::Path;
 
-/// Public per-project metadata a client needs before it can derive keys.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProjectMeta {
-    pub salt: String,
-    pub wrapped_dek: String,
-}
+// The stored row and the metadata response are the same two public fields, so the wire type
+// doubles as the row type rather than being copied field by field into it.
+use crate::common::wire::ProjectMeta;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PasswordResetResult {
