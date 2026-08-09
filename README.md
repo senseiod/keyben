@@ -352,10 +352,6 @@ keyben --insecure secrets get --projectName myapp --env dev --name DB_URL
 
 ---
 
-## 存储格式
-
-当前格式为 **v2**（Argon2id 密钥派生 + 信封加密），与 v0.1.x 写入的数据库和 `.keyben.toml` **不兼容**，且不提供迁移路径。升级方式：换一个全新的数据库路径启动服务端，逐个项目重新 `keyben init`，重新录入密钥，并用 `keyben config init` 重建项目本地配置文件。
-
 ## License
 
 keyben 基于 [MIT License](LICENSE) 发布。
