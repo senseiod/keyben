@@ -40,7 +40,7 @@ pub async fn run(cli: Cli) -> Result<()> {
 
     match command {
         Command::Init { .. } => {
-            // A password already resolved for `.keyben.toml` was confirmed when that file was
+            // A password already resolved for `~/.keyben.toml` was confirmed when that table was
             // written, so reuse it instead of asking for a fresh confirmation here.
             let password = match runtime.resolved_password() {
                 Some(password) => password.clone(),
@@ -112,11 +112,14 @@ pub async fn run(cli: Cli) -> Result<()> {
                 api.reset_password(project, &old_password, &new_password)
                     .await?;
 
-                if config::exists()? {
+                if config::contains(project)? {
+                    let file = config::path()?;
                     println!(
                         "Reset password for project `{project}`.\n\
-                         Note: .keyben.toml is still encrypted under the old password; \
-                         recreate it with `keyben config init` to use the new one."
+                         Note: its entry in {} is still encrypted under the old \
+                         password; recreate it with `keyben config init --projectName {project}` \
+                         to use the new one.",
+                        file.display()
                     );
                 } else {
                     println!("Reset password for project `{project}`");
@@ -157,7 +160,7 @@ fn project_name_arg(command: &Command) -> Option<&str> {
     }
 }
 
-/// Create or replace `.keyben.toml`.
+/// Add or replace one project in `~/.keyben.toml`.
 ///
 /// Every value is verified against the server before anything is written: a file that looks fine
 /// but holds a wrong token or password would only fail on the *next* command, far from the
@@ -171,14 +174,21 @@ async fn run_config_command(action: &ConfigCommand, cli: &Cli) -> Result<()> {
             config::validate(&project_name, &server, &token)?;
 
             // Ask before the network round trip, so a declined overwrite costs nothing.
-            if config::exists()? {
+            if config::contains(&project_name)? {
                 let file = config::path()?;
-                if !prompt::confirm(format!("{} already exists; overwrite it?", file.display())) {
-                    anyhow::bail!("Cancelled; {} was left unchanged", file.display());
+                if !prompt::confirm(format!(
+                    "{} already contains project `{project_name}`; replace that entry?",
+                    file.display()
+                )) {
+                    anyhow::bail!(
+                        "Cancelled; project `{project_name}` in {} was left unchanged",
+                        file.display()
+                    );
                 }
             }
 
-            // The project password also encrypts this file, so there is only one to remember.
+            // The project password also encrypts this project's table, so there is only one to
+            // remember.
             let password = prompt::new_password(
                 cli.password.as_ref(),
                 "Enter the project password",
@@ -195,7 +205,7 @@ async fn run_config_command(action: &ConfigCommand, cli: &Cli) -> Result<()> {
                         "Verification against {server} failed; {} was not written",
                         config::path()
                             .map(|p| p.display().to_string())
-                            .unwrap_or_else(|_| ".keyben.toml".to_owned())
+                            .unwrap_or_else(|_| "the user configuration file".to_owned())
                     )
                 })?;
 

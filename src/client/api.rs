@@ -107,14 +107,32 @@ impl Api {
         Ok(())
     }
 
-    /// Fetch the public metadata (salt + wrapped DEK) needed to derive keys. Bearer-only.
-    async fn fetch_meta(&self, project: &str) -> Result<wire::ProjectMeta> {
-        let url = format!("{}/api/project-meta/{}", self.base, percent_encode(project));
+    /// Fetch the public salt needed to derive the project keys. Bearer-only.
+    async fn fetch_kdf(&self, project: &str) -> Result<wire::ProjectKdf> {
+        let url = format!("{}/api/project-kdf/{}", self.base, percent_encode(project));
         self.send(self.http.get(url))
             .await?
             .json()
             .await
-            .context("Failed to parse project metadata from server")
+            .context("Failed to parse project KDF parameters from server")
+    }
+
+    /// Fetch the wrapped DEK after proving knowledge of the project password.
+    async fn fetch_meta(
+        &self,
+        project: &str,
+        keys: &crypto::ProjectKeys,
+    ) -> Result<wire::ProjectMeta> {
+        let url = format!("{}/api/project-meta/{}", self.base, percent_encode(project));
+        self.send(
+            self.http
+                .get(url)
+                .header(PROJECT_AUTH_HEADER, keys.auth_secret_b64()),
+        )
+        .await?
+        .json()
+        .await
+        .context("Failed to parse project metadata from server")
     }
 
     /// Unlock a project: fetch its metadata, derive keys from the password, and unwrap the DEK.
@@ -122,8 +140,9 @@ impl Api {
     /// This exercises every credential at once — the server URL, the bearer token, the project's
     /// existence, and the password — which is why `config init` uses it to verify before writing.
     pub async fn unlock(&self, project: &str, password: &str) -> Result<ProjectSession> {
-        let meta = self.fetch_meta(project).await?;
-        let keys = derive_keys(project, password, &meta.salt)?;
+        let kdf = self.fetch_kdf(project).await?;
+        let keys = derive_keys(project, password, &kdf.salt)?;
+        let meta = self.fetch_meta(project, &keys).await?;
         let dek = crypto::unwrap_dek(&keys, &meta.wrapped_dek, project)
             .context("Failed to unlock the project; incorrect password")?;
         Ok(ProjectSession { keys, dek })
@@ -138,8 +157,9 @@ impl Api {
     ) -> Result<()> {
         // Unlock with the old password to recover the DEK, then re-wrap that *same* DEK under a
         // fresh salt, so existing ciphertext keeps decrypting.
-        let meta = self.fetch_meta(project).await?;
-        let old_keys = derive_keys(project, old_password, &meta.salt)?;
+        let kdf = self.fetch_kdf(project).await?;
+        let old_keys = derive_keys(project, old_password, &kdf.salt)?;
+        let meta = self.fetch_meta(project, &old_keys).await?;
         let dek = crypto::unwrap_dek(&old_keys, &meta.wrapped_dek, project)
             .context("Failed to unlock the project with the current password")?;
 

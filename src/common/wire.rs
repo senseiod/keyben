@@ -25,12 +25,15 @@ pub struct ResetProjectPassword {
     pub auth_hash: String,
 }
 
-/// Public per-project metadata: everything a client needs to derive its keys, and nothing more.
-///
-/// Doubles as the storage row, since the database holds exactly these two public fields.
+/// Public KDF parameters fetched before the client can prove knowledge of the project password.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectKdf {
+    pub salt: String,
+}
+
+/// Password-protected project metadata returned only after project authentication.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectMeta {
-    pub salt: String,
     pub wrapped_dek: String,
 }
 

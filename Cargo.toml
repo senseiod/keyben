@@ -1,6 +1,6 @@
 [package]
 name = "keyben"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2024"
 
 [dependencies]
@@ -13,6 +13,7 @@ chacha20poly1305 = "0.11.0"
 clap = { version = "4.6.6", features = ["derive", "env"] }
 dialoguer = { version = "0.12.0", default-features = false, features = ["password"] }
 hkdf = "0.13.0"
+machine-uid = "0.6.0"
 rand = "0.10.2"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "charset", "http2"] }
 rustls = { version = "0.23.43", default-features = false, features = ["aws-lc-rs"] }
@@ -36,5 +37,6 @@ tower = { version = "0.5.3", features = ["util"] }
 [profile.release]
 opt-level = 3
 lto = "thin"
+panic = "abort"
 codegen-units = 1
 strip = "symbols"

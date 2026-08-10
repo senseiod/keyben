@@ -24,7 +24,9 @@ use db::{Db, PasswordResetResult};
 use crate::common::{
     consts::PROJECT_AUTH_HEADER,
     env::Env,
-    wire::{CreateProject, ProjectMeta, ResetProjectPassword, SecretEntry, SecretValue},
+    wire::{
+        CreateProject, ProjectKdf, ProjectMeta, ResetProjectPassword, SecretEntry, SecretValue,
+    },
 };
 
 mod config;
@@ -93,6 +95,7 @@ fn router(db: Db, auth_token: &str) -> Router {
             "/api/project-passwords/{project}",
             post(reset_project_password),
         )
+        .route("/api/project-kdf/{project}", get(get_project_kdf))
         .route("/api/project-meta/{project}", get(get_project_meta))
         .route("/api/projects/{project}/{env}", get(list_secrets))
         .route(
@@ -194,11 +197,26 @@ async fn create_project(
     }
 }
 
+async fn get_project_kdf(
+    State(db): State<Db>,
+    AxumPath(project): AxumPath<String>,
+) -> Result<Json<ProjectKdf>, ApiError> {
+    let project = canonical_project(&project)?;
+    match db.project_kdf(project).await? {
+        Some(kdf) => Ok(Json(kdf)),
+        None => Err(ApiError::not_found(format!(
+            "Project `{project}` does not exist"
+        ))),
+    }
+}
+
 async fn get_project_meta(
     State(db): State<Db>,
     AxumPath(project): AxumPath<String>,
+    headers: HeaderMap,
 ) -> Result<Json<ProjectMeta>, ApiError> {
     let project = canonical_project(&project)?;
+    authorize_project(&db, project, &headers).await?;
     match db.project_meta(project).await? {
         Some(meta) => Ok(Json(meta)),
         None => Err(ApiError::not_found(format!(
@@ -475,9 +493,9 @@ mod tests {
         let db = Db::open(&path).await.unwrap();
 
         // Two projects whose names collide with the path segments used by other routes.
+        let salt = crypto::generate_salt();
+        let keys = crypto::derive_project_keys("pw", &salt).unwrap();
         for name in ["meta", "app"] {
-            let salt = crypto::generate_salt();
-            let keys = crypto::derive_project_keys("pw", &salt).unwrap();
             let dek = crypto::generate_dek();
             db.create_project(
                 name,
@@ -489,26 +507,49 @@ mod tests {
             .unwrap();
         }
 
-        let call = |uri: &str, token: Option<&str>| {
+        let call = |uri: &str, token: Option<&str>, project_auth: Option<&str>| {
             // Router::route panics on a conflicting table, so building it is itself a check.
             let app = router(db.clone(), "t0ken");
             let mut request = Request::builder().uri(uri.to_owned());
             if let Some(token) = token {
                 request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
             }
+            if let Some(project_auth) = project_auth {
+                request = request.header(PROJECT_AUTH_HEADER, project_auth);
+            }
             app.oneshot(request.body(axum::body::Body::empty()).unwrap())
         };
 
-        // Metadata resolves for a project named "meta" without colliding with its own route.
+        // KDF parameters are Bearer-only; metadata additionally requires project authentication.
         assert_eq!(
-            call("/api/project-meta/meta", Some("t0ken"))
+            call("/api/project-kdf/meta", Some("t0ken"), None)
                 .await
                 .unwrap()
                 .status(),
             StatusCode::OK
         );
         assert_eq!(
-            call("/api/project-meta/app", Some("t0ken"))
+            call("/api/project-meta/app", Some("t0ken"), None)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        let project_auth = keys.auth_secret_b64();
+        let wrong_project_auth = B64.encode([1u8; 32]);
+        assert_eq!(
+            call(
+                "/api/project-meta/app",
+                Some("t0ken"),
+                Some(&wrong_project_auth)
+            )
+            .await
+            .unwrap()
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            call("/api/project-meta/app", Some("t0ken"), Some(&project_auth))
                 .await
                 .unwrap()
                 .status(),
@@ -516,7 +557,7 @@ mod tests {
         );
         // `meta` is a normal project name in the secrets namespace, not a reserved word.
         assert_eq!(
-            call("/api/projects/meta/dev", Some("t0ken"))
+            call("/api/projects/meta/dev", Some("t0ken"), None)
                 .await
                 .unwrap()
                 .status(),
@@ -525,27 +566,33 @@ mod tests {
         );
         // An unknown environment still reaches the env check rather than the metadata handler.
         assert_eq!(
-            call("/api/projects/app/meta", Some("t0ken"))
+            call("/api/projects/app/meta", Some("t0ken"), None)
                 .await
                 .unwrap()
                 .status(),
             StatusCode::BAD_REQUEST
         );
         // Every route, healthz included, sits behind the bearer layer.
-        for uri in ["/healthz", "/api/project-meta/app"] {
+        for uri in ["/healthz", "/api/project-kdf/app", "/api/project-meta/app"] {
             assert_eq!(
-                call(uri, None).await.unwrap().status(),
+                call(uri, None, Some(&project_auth)).await.unwrap().status(),
                 StatusCode::UNAUTHORIZED,
                 "{uri}"
             );
             assert_eq!(
-                call(uri, Some("wrong")).await.unwrap().status(),
+                call(uri, Some("wrong"), Some(&project_auth))
+                    .await
+                    .unwrap()
+                    .status(),
                 StatusCode::UNAUTHORIZED,
                 "{uri}"
             );
         }
         assert_eq!(
-            call("/healthz", Some("t0ken")).await.unwrap().status(),
+            call("/healthz", Some("t0ken"), None)
+                .await
+                .unwrap()
+                .status(),
             StatusCode::OK
         );
 
@@ -575,11 +622,18 @@ mod tests {
         .await
         .unwrap();
 
-        // The untrimmed name resolves rather than 404ing.
-        let Json(meta) = get_project_meta(State(db.clone()), AxumPath(" app ".to_owned()))
+        // The untrimmed name resolves rather than 404ing in both stages.
+        let Json(kdf) = get_project_kdf(State(db.clone()), AxumPath(" app ".to_owned()))
             .await
             .unwrap();
-        assert_eq!(meta.salt, B64.encode(salt));
+        assert_eq!(kdf.salt, B64.encode(salt));
+        let _ = get_project_meta(
+            State(db.clone()),
+            AxumPath(" app ".to_owned()),
+            auth_headers(&keys),
+        )
+        .await
+        .unwrap();
 
         // And so does a write followed by a read through differently-padded names.
         let blob = crypto::encrypt_secret(&dek, "app", "dev", "K", "v").unwrap();
@@ -604,7 +658,7 @@ mod tests {
 
         // An all-whitespace name is still rejected outright.
         assert_eq!(
-            get_project_meta(State(db.clone()), AxumPath("   ".to_owned()))
+            get_project_kdf(State(db.clone()), AxumPath("   ".to_owned()))
                 .await
                 .unwrap_err()
                 .status,
@@ -690,11 +744,18 @@ mod tests {
             StatusCode::CONFLICT
         );
 
-        // Metadata is readable with only the bearer token, so a client can derive its keys.
-        let Json(meta) = get_project_meta(State(db.clone()), AxumPath("app".to_owned()))
+        // The salt is fetched first; the wrapped DEK requires the derived project auth secret.
+        let Json(kdf) = get_project_kdf(State(db.clone()), AxumPath("app".to_owned()))
             .await
             .unwrap();
-        assert_eq!(meta.salt, B64.encode(salt));
+        assert_eq!(kdf.salt, B64.encode(salt));
+        let Json(meta) = get_project_meta(
+            State(db.clone()),
+            AxumPath("app".to_owned()),
+            auth_headers(&keys),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             crypto::unwrap_dek(&keys, &meta.wrapped_dek, "app").unwrap(),
             dek
@@ -729,9 +790,17 @@ mod tests {
         .unwrap();
 
         // The new password unwraps the same DEK, so untouched ciphertext still decrypts.
-        let Json(meta) = get_project_meta(State(db.clone()), AxumPath("app".to_owned()))
+        let Json(kdf) = get_project_kdf(State(db.clone()), AxumPath("app".to_owned()))
             .await
             .unwrap();
+        assert_eq!(kdf.salt, B64.encode(new_salt));
+        let Json(meta) = get_project_meta(
+            State(db.clone()),
+            AxumPath("app".to_owned()),
+            auth_headers(&new_keys),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             crypto::unwrap_dek(&new_keys, &meta.wrapped_dek, "app").unwrap(),
             dek

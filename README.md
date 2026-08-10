@@ -218,9 +218,9 @@ keyben run --projectName myapp --env dev -- npm run dev
 
 # Extras
 
-# Create a .keyben.toml in your project so you can skip --projectName --token --server next time.
+# Add the project to ~/.keyben.toml so next time you only need its name and password.
 # The values are verified against the server before the file is written.
-keyben config init 
+keyben config init --projectName myapp
 ```
 
 ### Command overview
@@ -228,7 +228,7 @@ keyben config init
 | Command | What it does |
 | --- | --- |
 | `keyben init` | Create a project on the server and set its password |
-| `keyben config init` | Generate the project-local encrypted config file `.keyben.toml`, after verifying every value against the server |
+| `keyben config init` | Verify the values, then add the project to the per-user `~/.keyben.toml` file |
 | `keyben secrets set` | Encrypt and store a variable |
 | `keyben secrets get` | Fetch and decrypt one variable, or a whole environment |
 | `keyben secrets delete` | Delete a variable |
@@ -249,7 +249,7 @@ keyben init
 keyben secrets set
 ```
 
-Environments are chosen from a list rather than typed, and passwords and tokens are read without echoing. Values already supplied — as flags, as `KEYBEN_*` environment variables, or from `.keyben.toml` — are never asked about again, so automation stays non-interactive. When there's no terminal to prompt on, the error names the flag and the environment variable that would have supplied the value.
+Environments are chosen from a list rather than typed, and passwords and tokens are read without echoing. Values already supplied — as flags, as `KEYBEN_*` environment variables, or from the selected project in `~/.keyben.toml` — are never asked about again, so automation stays non-interactive. When there's no terminal to prompt on, the error names the flag and the environment variable that would have supplied the value.
 
 The one exception is `keyben run`: the program after `--` is still required, since there's no sensible way to prompt for a command line along with its argument boundaries.
 
@@ -257,15 +257,29 @@ The one exception is `keyben run`: the program after `--` is still required, sin
 keyben run -- npm run dev   # prompts for project name and environment
 ```
 
-### Project-local configuration
+### Per-user multi-project configuration
 
-If you'd rather not export environment variables or pass `--projectName --token --server` every time, generate an encrypted `.keyben.toml` in the project directory:
+If you'd rather not pass `--server` and `--token` every time, add the project to the per-user config file. Linux and macOS use `~/.keyben.toml`; Windows uses `%USERPROFILE%\.keyben.toml`:
 
 ```bash
-keyben config init
+keyben config init --projectName myapp
 ```
 
-Anything you omit is asked for interactively. The server address and token are encrypted with the **project password** before being written — so you only have to remember one password. The project name stays in plaintext and acts as the default project identifier. If the file already exists, you'll be asked before it's overwritten.
+Anything you omit is asked for interactively. The server address and token are encrypted using the **project password concatenated with the current machine UID** as the Argon2id input, and every project has an independent salt. The UID comes from `machine-uid` and is not stored in the file. One file can hold multiple projects:
+
+```toml
+[myapp]
+salt = "Base64 salt"
+encrypted_server = "encrypted server URL"
+encrypted_token = "encrypted auth_token"
+
+[another-project]
+salt = "Base64 salt"
+encrypted_server = "encrypted server URL"
+encrypted_token = "encrypted auth_token"
+```
+
+Initializing the same project again asks before replacing only that section; other projects are preserved. The file does not select a default project, so pass `--projectName` or enter the project name interactively when running a command.
 
 Every value is checked against the server before anything is written. A single unlock attempt exercises all four at once, so each failure is reported where the mistake was made rather than on some later command:
 
@@ -276,17 +290,25 @@ Every value is checked against the server before anything is written. A single u
 | Project doesn't exist on that server | ``Project `myapp` does not exist`` |
 | Wrong project password | `Failed to unlock the project; incorrect password` |
 
-If verification fails, the file is not created or modified, and the error says so explicitly. There's no flag to skip the check — a `.keyben.toml` that looks right but holds a bad token is exactly the failure this prevents.
+If verification fails, the file is not created or modified, and the error says so explicitly. There's no flag to skip the check — a saved entry that looks right but holds a bad token is exactly the failure this prevents.
 
-From then on, any command run in that directory asks for the project password once and uses it to both decrypt the config file and unlock the project. Resolution order:
+You can then run commands from any directory. This reads `[myapp]`, asks for the password once, and uses it to decrypt server/token and unlock the project:
+
+```bash
+keyben secrets get --projectName myapp --env dev
+# Non-interactive use
+keyben secrets get --projectName myapp --password "$KEYBEN_PASSWORD" --env dev
+```
+
+Resolution order:
 
 ```text
-command-line flags  >  KEYBEN_SERVER / KEYBEN_TOKEN  >  .keyben.toml
+explicit command-line flags such as --server / --token > KEYBEN_SERVER / KEYBEN_TOKEN environment variables > project section in the user config file
 ```
 
 For automation, use `--password` or `KEYBEN_PASSWORD` to skip the prompt.
 
-> **This file contains no key material.** It's encrypted with its own Argon2id salt under a key unrelated to the project master key; the project DEK always stays wrapped on the server. Cracking this file gets someone whatever the token can reach — it still doesn't unlock any secret. keyben does not set special file permissions on it, so don't commit it to version control unless that's what you intend.
+> **This file contains no project DEK.** Every section uses an independent Argon2id salt and a key unrelated to the project master key; the project DEK always stays wrapped on the server. The config is bound to the device that created it. Copying it to another device, entering the wrong password, or changing the machine UID reports `Project password is incorrect`; run `keyben config init` again. Keyben does not set or modify permissions on this file.
 
 ### Managing secrets
 
@@ -346,7 +368,7 @@ keyben password reset --projectName myapp \
 
 Either password is prompted for securely when omitted. Because values are encrypted with the per-project DEK rather than the password itself, a reset just re-derives the key and re-wraps **the same DEK** under the new password — the stored ciphertext is untouched, which makes it fast and free of half-broken states. An incorrect current password is rejected by the server. For automation, pass the new password via `KEYBEN_NEW_PASSWORD`.
 
-> A `.keyben.toml` in the working directory still points at the old password; regenerate it with `keyben config init` after a reset.
+> That project's section in `~/.keyben.toml` is still encrypted under the old password. After a reset, update it with `keyben config init --projectName <name>`; other projects are unaffected.
 
 ### Self-signed certificates
 

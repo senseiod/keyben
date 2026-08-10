@@ -218,9 +218,9 @@ keyben run --projectName myapp --env dev -- npm run dev
 
 # 其他
 
-# 在你的项目中创建一个.keyben.toml. 下次就无需输入--projectName --token --server
+# 将项目加入 ~/.keyben.toml，下次只需指定项目名和密码
 # 写入之前会先到服务端校验这些值
-keyben config init 
+keyben config init --projectName myapp
 ```
 
 ### 命令一览
@@ -228,7 +228,7 @@ keyben config init
 | 命令 | 作用 |
 | --- | --- |
 | `keyben init` | 在服务端创建项目并设置密码 |
-| `keyben config init` | 到服务端校验所有值，通过后生成项目本地的加密配置文件 `.keyben.toml` |
+| `keyben config init` | 到服务端校验所有值，通过后将项目加入用户目录下的 `~/.keyben.toml` |
 | `keyben secrets set` | 加密并写入一个变量 |
 | `keyben secrets get` | 读取并解密一个变量，或整个环境 |
 | `keyben secrets delete` | 删除一个变量 |
@@ -249,7 +249,7 @@ keyben init
 keyben secrets set
 ```
 
-环境从列表中选择而不是手输；密码和 token 以不回显的方式读取。已经给过的值 —— 命令行参数、`KEYBEN_*` 环境变量、或 `.keyben.toml` 里的 —— 不会再问一遍，所以自动化场景依然免交互。在没有终端可供交互时，错误信息会直接指出该用哪个参数、哪个环境变量。
+环境从列表中选择而不是手输；密码和 token 以不回显的方式读取。已经给过的值 —— 命令行参数、`KEYBEN_*` 环境变量、或 `~/.keyben.toml` 中所选项目里的 —— 不会再问一遍，所以自动化场景依然免交互。在没有终端可供交互时，错误信息会直接指出该用哪个参数、哪个环境变量。
 
 唯一的例外是 `keyben run`：`--` 之后的程序仍然必填，因为没有合理的方式去交互式地询问一整条命令行以及它的参数边界。
 
@@ -257,15 +257,29 @@ keyben secrets set
 keyben run -- npm run dev   # 会询问项目名和环境
 ```
 
-### 项目本地配置
+### 用户级多项目配置
 
-不想每次都导出环境变量或输入--projectName --token --server，可以在项目目录生成一个加密的 `.keyben.toml`：
+不想每次都输入 `--server` 和 `--token`，可以把项目加入用户主目录下的配置文件。Linux/macOS 使用 `~/.keyben.toml`，Windows 使用 `%USERPROFILE%\.keyben.toml`：
 
 ```bash
-keyben config init
+keyben config init --projectName myapp
 ```
 
-省略的值会交互式询问。服务器地址和 token 用**项目密码**加密后写入 —— 只需要记一个密码。项目名保持明文，作为默认的项目标识。文件已存在时会先询问是否覆盖。
+省略的值会交互式询问。服务器地址和 token 使用“**项目密码拼接当前设备 machine UID**”作为 Argon2id 输入进行加密；每个项目都有独立 salt。machine UID 通过 `machine-uid` 获取且不会写进配置文件。一个文件可以保存多个项目：
+
+```toml
+[myapp]
+salt = "Base64 salt"
+encrypted_server = "加密后的服务器地址"
+encrypted_token = "加密后的 auth_token"
+
+[another-project]
+salt = "Base64 salt"
+encrypted_server = "加密后的服务器地址"
+encrypted_token = "加密后的 auth_token"
+```
+
+再次初始化同名项目时会询问是否替换该 section；其他项目不会被修改。项目名不会从配置文件中自动选择，因此运行命令时需要提供 `--projectName`，或者在交互提示中选择要使用的项目名。
 
 写入之前，所有值都会先到服务端校验一遍。一次解锁请求同时验证下面四项，任何一项出错都在犯错的地方直接报出来，而不是拖到下一条命令：
 
@@ -276,17 +290,25 @@ keyben config init
 | 该服务端上没有这个项目 | ``Project `myapp` does not exist`` |
 | 项目密码不对 | `Failed to unlock the project; incorrect password` |
 
-校验不通过时，文件不会被创建也不会被修改，错误信息里会明确说明这一点。没有跳过校验的开关 —— 一个看起来没问题、实际存着错 token 的 `.keyben.toml`，正是这一步要避免的。
+校验不通过时，文件不会被创建也不会被修改，错误信息里会明确说明这一点。没有跳过校验的开关 —— 一个看起来没问题、实际存着错 token 的配置项，正是这一步要避免的。
 
-之后在该目录下运行任何命令，keyben 问一次项目密码，同时用它解密配置文件和解锁项目。取值优先级：
+之后可以在任意目录运行。例如下面的命令会读取 `[myapp]`，询问一次密码，并用它同时解密 server/token 和解锁项目：
+
+```bash
+keyben secrets get --projectName myapp --env dev
+# 自动化场景
+keyben secrets get --projectName myapp --password "$KEYBEN_PASSWORD" --env dev
+```
+
+取值优先级：
 
 ```text
-命令行参数  >  KEYBEN_SERVER / KEYBEN_TOKEN  >  .keyben.toml
+终端显式参数（如 --server / --token） > KEYBEN_SERVER / KEYBEN_TOKEN 等环境变量 > 用户配置文件中的项目 section
 ```
 
 自动化场景用 `--password` 或 `KEYBEN_PASSWORD` 免交互。
 
-> **这个文件里没有密钥材料。** 它用独立的 Argon2id 盐加密，密钥与项目主密钥无关；项目 DEK 始终包裹在服务端。破解这个文件的人得到的是 token 的可达范围，仍然解不开任何密钥。keyben 不会为它设置特殊的文件权限 —— 除非有意为之，否则不要提交进版本库。
+> **这个文件里没有项目 DEK。** 每个 section 使用独立的 Argon2id 盐加密，密钥与项目主密钥无关；项目 DEK 始终包裹在服务端。配置与创建它的设备绑定，复制到另一台设备、输入错误密码或设备 machine UID 发生变化时都会直接报告 `Project password is incorrect`，需要重新执行 `keyben config init`。keyben 不会主动设置或修改该文件的权限。
 
 ### 管理密钥
 
@@ -346,7 +368,7 @@ keyben password reset --projectName myapp \
 
 任一密码省略时会安全提示输入。因为值是用每项目的 DEK 加密而非直接用密码，重置只是重新派生密钥并用新密码重新包裹**同一个 DEK** —— 存储的密文完全不动，所以又快又不会产生半损坏状态。当前密码不正确会被服务端拒绝。自动化可以用 `KEYBEN_NEW_PASSWORD` 传入新密码。
 
-> 工作目录下的 `.keyben.toml` 仍然停留在旧密码上，重置后用 `keyben config init` 重新生成。
+> `~/.keyben.toml` 中该项目的 section 仍然使用旧密码加密，重置后用 `keyben config init --projectName <项目名>` 更新它；其他项目不受影响。
 
 ### 自签名证书
 

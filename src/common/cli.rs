@@ -61,7 +61,7 @@ pub struct Cli {
     )]
     pub token: Option<Password>,
 
-    /// Project password; also decrypts `.keyben.toml`. Prompts securely when omitted.
+    /// Project password; also decrypts its entry in the user config file. Prompts when omitted.
     #[arg(
         long,
         global = true,
@@ -98,7 +98,7 @@ pub enum Command {
         project_name: Option<String>,
     },
 
-    /// Manage the project-local client configuration.
+    /// Manage the per-user, multi-project client configuration.
     Config {
         #[command(subcommand)]
         action: ConfigCommand,
@@ -191,7 +191,7 @@ pub enum SecretsCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum ConfigCommand {
-    /// Create or replace the project-local .keyben.toml file.
+    /// Add or replace a project in the user config file.
     Init {
         /// Project name; prompts interactively when omitted.
         #[arg(long = "projectName", value_name = "NAME")]
@@ -222,6 +222,47 @@ pub enum PasswordCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Clap reads `KEYBEN_*` as fallback values for these global flags. Run this assertion in a
+    /// child test process so setting environment variables cannot race the parallel test suite.
+    #[test]
+    fn command_line_credentials_override_environment() {
+        const MARKER: &str = "KEYBEN_TEST_CLI_PRIORITY";
+        if std::env::var_os(MARKER).is_some() {
+            let cli = Cli::try_parse_from([
+                "keyben",
+                "--server",
+                "https://cli.example",
+                "--token",
+                "cli-token",
+                "--password",
+                "cli-password",
+                "secrets",
+                "get",
+            ])
+            .unwrap();
+            assert_eq!(cli.server.as_deref(), Some("https://cli.example"));
+            assert_eq!(cli.token.as_deref().map(String::as_str), Some("cli-token"));
+            assert_eq!(
+                cli.password.as_deref().map(String::as_str),
+                Some("cli-password")
+            );
+            return;
+        }
+
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "common::cli::tests::command_line_credentials_override_environment",
+                "--exact",
+            ])
+            .env(MARKER, "1")
+            .env("KEYBEN_SERVER", "https://env.example")
+            .env("KEYBEN_TOKEN", "env-token")
+            .env("KEYBEN_PASSWORD", "env-password")
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
 
     #[test]
     fn accepts_global_password_after_nested_subcommand_arguments() {

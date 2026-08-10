@@ -10,7 +10,7 @@ use std::time::Duration;
 /// The client sends it and the server hashes it, so the two must name it identically.
 pub const PROJECT_AUTH_HEADER: &str = "x-keyben-project-auth";
 
-/// Name of the project-local client configuration file.
+/// Name of the per-user, multi-project client configuration file in the home directory.
 pub const CONFIG_FILE_NAME: &str = ".keyben.toml";
 
 /// Prefix of every environment variable keyben itself reads.

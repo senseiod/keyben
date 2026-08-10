@@ -7,9 +7,7 @@ use sqlx::{
 };
 use std::path::Path;
 
-// The stored row and the metadata response are the same two public fields, so the wire type
-// doubles as the row type rather than being copied field by field into it.
-use crate::common::wire::ProjectMeta;
+use crate::common::wire::{ProjectKdf, ProjectMeta};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PasswordResetResult {
@@ -89,16 +87,22 @@ impl Db {
         Ok(result.rows_affected() > 0)
     }
 
-    /// Fetch the public metadata (salt + wrapped DEK) a client needs to derive keys.
-    pub async fn project_meta(&self, name: &str) -> Result<Option<ProjectMeta>, sqlx::Error> {
-        let row = sqlx::query("SELECT salt, wrapped_dek FROM projects WHERE name = ?")
+    /// Fetch the public salt a client needs before it can derive the project auth secret.
+    pub async fn project_kdf(&self, name: &str) -> Result<Option<ProjectKdf>, sqlx::Error> {
+        let salt = sqlx::query_scalar("SELECT salt FROM projects WHERE name = ?")
             .bind(name)
             .fetch_optional(&self.pool)
             .await?;
-        Ok(row.map(|row| ProjectMeta {
-            salt: row.get("salt"),
-            wrapped_dek: row.get("wrapped_dek"),
-        }))
+        Ok(salt.map(|salt| ProjectKdf { salt }))
+    }
+
+    /// Fetch the wrapped DEK returned only after project authentication.
+    pub async fn project_meta(&self, name: &str) -> Result<Option<ProjectMeta>, sqlx::Error> {
+        let wrapped_dek = sqlx::query_scalar("SELECT wrapped_dek FROM projects WHERE name = ?")
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(wrapped_dek.map(|wrapped_dek| ProjectMeta { wrapped_dek }))
     }
 
     pub async fn project_auth_hash(&self, name: &str) -> Result<Option<String>, sqlx::Error> {
@@ -277,9 +281,14 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(
+            db.project_kdf("app").await.unwrap(),
+            Some(ProjectKdf {
+                salt: "salt-1".to_owned(),
+            })
+        );
+        assert_eq!(
             db.project_meta("app").await.unwrap(),
             Some(ProjectMeta {
-                salt: "salt-1".to_owned(),
                 wrapped_dek: "dek-1".to_owned(),
             })
         );
@@ -309,9 +318,14 @@ mod tests {
             PasswordResetResult::Updated
         );
         assert_eq!(
+            db.project_kdf("app").await.unwrap(),
+            Some(ProjectKdf {
+                salt: "new-salt".to_owned(),
+            })
+        );
+        assert_eq!(
             db.project_meta("app").await.unwrap(),
             Some(ProjectMeta {
-                salt: "new-salt".to_owned(),
                 wrapped_dek: "new-dek".to_owned(),
             })
         );
@@ -349,9 +363,14 @@ mod tests {
             PasswordResetResult::PasswordMismatch
         );
         assert_eq!(
+            db.project_kdf("app").await.unwrap(),
+            Some(ProjectKdf {
+                salt: "old-salt".to_owned(),
+            })
+        );
+        assert_eq!(
             db.project_meta("app").await.unwrap(),
             Some(ProjectMeta {
-                salt: "old-salt".to_owned(),
                 wrapped_dek: "old-dek".to_owned(),
             })
         );
