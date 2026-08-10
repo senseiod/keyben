@@ -20,6 +20,7 @@ use config::Config;
 
 mod api;
 mod config;
+mod export;
 mod prompt;
 mod runtime;
 
@@ -127,6 +128,20 @@ pub async fn run(cli: Cli) -> Result<()> {
             }
         },
 
+        Command::Export {
+            env,
+            format,
+            output_file,
+            ..
+        } => {
+            let env = prompt::env(*env)?;
+            let password = runtime.project_password(cli.password.as_ref())?;
+            let session = api.unlock(project, &password).await?;
+            let secrets = api.fetch_all(project, env, &session).await?;
+            let output = export::render(&secrets, *format)?;
+            export::write(&output, output_file.as_deref())?;
+        }
+
         Command::Run { env, argv, .. } => {
             let env = prompt::env(*env)?;
             let password = runtime.project_password(cli.password.as_ref())?;
@@ -145,9 +160,9 @@ pub async fn run(cli: Cli) -> Result<()> {
 
 fn project_name_arg(command: &Command) -> Option<&str> {
     match command {
-        Command::Init { project_name } | Command::Run { project_name, .. } => {
-            project_name.as_deref()
-        }
+        Command::Init { project_name }
+        | Command::Export { project_name, .. }
+        | Command::Run { project_name, .. } => project_name.as_deref(),
         Command::Secrets { action } => match action {
             SecretsCommand::Set { project_name, .. }
             | SecretsCommand::Get { project_name, .. }

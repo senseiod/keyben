@@ -216,6 +216,9 @@ keyben secrets get --projectName myapp --env dev
 # 4. Pass the secrets to your service
 keyben run --projectName myapp --env dev -- npm run dev
 
+# Or export them in dotenv / JSON / YAML form
+keyben export --projectName myapp --env dev --output-file .env
+
 # Extras
 
 # Add the project to ~/.keyben.toml so next time you only need its name and password.
@@ -233,6 +236,7 @@ keyben config init --projectName myapp
 | `keyben secrets get` | Fetch and decrypt one variable, or a whole environment |
 | `keyben secrets delete` | Delete a variable |
 | `keyben password reset` | Change the project password (ciphertext untouched) |
+| `keyben export` | Export a decrypted environment as dotenv, JSON, or YAML |
 | `keyben run -- <cmd>` | Inject decrypted environment variables and launch a child process |
 
 Global options: `--server` / `--token` / `--password` / `--insecure`, matching the environment variables `KEYBEN_SERVER`, `KEYBEN_TOKEN`, `KEYBEN_PASSWORD`, and `KEYBEN_INSECURE`.
@@ -342,6 +346,32 @@ keyben secrets get --projectName myapp --env dev
 ```
 
 Output is sorted by variable name in `KEY=VALUE` form. Values containing newlines naturally span multiple lines.
+
+### Exporting an environment
+
+Like `infisical export`, `keyben export` writes to standard output by default and can write
+directly to a file with `--output-file`. The default format is `dotenv`; output is always sorted
+by variable name.
+
+```bash
+# dotenv (KEY="value")
+keyben export --projectName myapp --env dev > .env
+keyben export --projectName myapp --env dev --output-file .env
+
+# dotenv with an export prefix
+keyben export --projectName myapp --env dev --format dotenv-export
+
+# POSIX-shell quoting, safe for eval/source
+eval "$(keyben export --projectName myapp --env dev --format dotenv-eval)"
+
+# JSON or YAML
+keyben export --projectName myapp --env prod --format json --output-file secrets.json
+keyben export --projectName myapp --env prod --format yaml > secrets.yaml
+```
+
+Dotenv formats require normal shell variable names such as `DB_URL`; secrets with names such as
+`api-key` can still be exported as JSON or YAML. Exported files contain plaintext secrets, so keep
+them out of version control and restrict their permissions.
 
 **Delete**
 

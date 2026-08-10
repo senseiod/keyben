@@ -216,6 +216,9 @@ keyben secrets get --projectName myapp --env dev
 # 4. 将密钥传递给你的服务
 keyben run --projectName myapp --env dev -- npm run dev
 
+# 或导出为 dotenv / JSON / YAML
+keyben export --projectName myapp --env dev --output-file .env
+
 # 其他
 
 # 将项目加入 ~/.keyben.toml，下次只需指定项目名和密码
@@ -233,6 +236,7 @@ keyben config init --projectName myapp
 | `keyben secrets get` | 读取并解密一个变量，或整个环境 |
 | `keyben secrets delete` | 删除一个变量 |
 | `keyben password reset` | 更换项目密码（密文不动） |
+| `keyben export` | 将解密后的整个环境导出为 dotenv、JSON 或 YAML |
 | `keyben run -- <cmd>` | 注入解密后的环境变量并启动子进程 |
 
 全局选项：`--server` / `--token` / `--password` / `--insecure`，分别对应环境变量 `KEYBEN_SERVER`、`KEYBEN_TOKEN`、`KEYBEN_PASSWORD`、`KEYBEN_INSECURE`。
@@ -342,6 +346,30 @@ keyben secrets get --projectName myapp --env dev
 ```
 
 按变量名排序，以 `KEY=VALUE` 的形式输出。含换行的值自然会跨多行。
+
+### 导出整个环境
+
+与 `infisical export` 类似，`keyben export` 默认写到标准输出，也可以用
+`--output-file` 直接写入文件。默认格式是 `dotenv`，所有格式均按变量名排序。
+
+```bash
+# dotenv（KEY="value"）
+keyben export --projectName myapp --env dev > .env
+keyben export --projectName myapp --env dev --output-file .env
+
+# 带 export 前缀的 dotenv
+keyben export --projectName myapp --env dev --format dotenv-export
+
+# POSIX shell 安全转义，可用于 eval/source
+eval "$(keyben export --projectName myapp --env dev --format dotenv-eval)"
+
+# JSON 或 YAML
+keyben export --projectName myapp --env prod --format json --output-file secrets.json
+keyben export --projectName myapp --env prod --format yaml > secrets.yaml
+```
+
+dotenv 格式要求使用 `DB_URL` 这类标准 shell 变量名；`api-key` 这类名称仍可导出为
+JSON 或 YAML。导出文件包含明文密钥，请勿提交到版本控制，并注意限制文件权限。
 
 **删除**
 

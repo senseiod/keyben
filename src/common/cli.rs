@@ -2,14 +2,14 @@
 //!
 //! The binary has two operating modes:
 //! - provide `-c/--config` to run as the server (`keyben-server`);
-//! - provide a subcommand (`init` / `secrets` / `password` / `run`) to run as the client.
+//! - provide a subcommand (`init` / `secrets` / `password` / `export` / `run`) to run as the client.
 //!
 //! Every value the client needs is optional here. A missing one is not an error: the client
 //! prompts for it (see `client::prompt`), so any command can be started bare. The single
 //! exception is the program after `--` in `keyben run`, which clap still requires — there is
 //! no sensible way to prompt for a command line plus its argument boundaries.
 
-use clap::{ArgAction, Parser, Subcommand, builder::BoolishValueParser};
+use clap::{ArgAction, Parser, Subcommand, ValueEnum, builder::BoolishValueParser};
 use std::path::PathBuf;
 use zeroize::Zeroizing;
 
@@ -31,13 +31,14 @@ fn wiped_on_drop(value: &str) -> Result<Password, std::convert::Infallible> {
     about = "End-to-end encrypted environment variable manager (one binary for client and server)",
     long_about = "keyben — an end-to-end encrypted environment variable manager.\n\n\
                   Server mode: keyben -c /etc/keyben/config.toml\n\
-                  Client mode: keyben init | keyben secrets ... | keyben password ... | keyben run ...\n\n\
+                  Client mode: keyben init | keyben secrets ... | keyben password ... | keyben export ... | keyben run ...\n\n\
                   All encryption and decryption happen on the client (XChaCha20-Poly1305); the server stores only Base64 ciphertext.",
     after_help = "Examples:\n  \
         keyben -c config.toml\n  \
         keyben --server http://127.0.0.1:8000 init --projectName myapp\n  \
         keyben secrets set --projectName myapp --env dev --name DB_URL --value 'postgres://...'\n  \
         keyben secrets get --projectName myapp --env dev\n  \
+        keyben export --projectName myapp --env prod --format json --output-file secrets.json\n  \
         keyben password reset --projectName myapp\n  \
         keyben run --projectName myapp --env prod -- ./server --port 8080"
 )]
@@ -114,6 +115,25 @@ pub enum Command {
     Password {
         #[command(subcommand)]
         action: PasswordCommand,
+    },
+
+    /// Export a decrypted environment in dotenv, JSON, or YAML form.
+    Export {
+        /// Project name; prompts interactively when omitted.
+        #[arg(long = "projectName", value_name = "NAME")]
+        project_name: Option<String>,
+
+        /// Environment; prompts interactively when omitted.
+        #[arg(long, value_enum)]
+        env: Option<Env>,
+
+        /// Output format. The default matches Infisical's dotenv export.
+        #[arg(long, value_enum, default_value = "dotenv")]
+        format: ExportFormat,
+
+        /// Write to this file instead of standard output.
+        #[arg(long = "output-file", value_name = "FILE")]
+        output_file: Option<PathBuf>,
     },
 
     /// Inject decrypted environment variables and launch a child process.
@@ -217,6 +237,22 @@ pub enum PasswordCommand {
         )]
         new_password: Option<Password>,
     },
+}
+
+/// Formats supported by `keyben export`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+pub enum ExportFormat {
+    /// KEY="value", suitable for dotenv files.
+    Dotenv,
+    /// export KEY="value", suitable for dotenv files that accept the export prefix.
+    DotenvExport,
+    /// POSIX-shell-quoted assignments, safe for eval/source.
+    DotenvEval,
+    /// A JSON object mapping variable names to values.
+    Json,
+    /// A YAML mapping of variable names to values.
+    Yaml,
 }
 
 #[cfg(test)]
@@ -345,6 +381,52 @@ mod tests {
         assert_eq!(value, None);
     }
 
+    #[test]
+    fn parses_export_format_and_output_file() {
+        let cli = Cli::try_parse_from([
+            "keyben",
+            "export",
+            "--projectName",
+            "frontierkings",
+            "--env",
+            "prod",
+            "--format",
+            "dotenv-eval",
+            "--output-file",
+            ".env",
+        ])
+        .unwrap();
+
+        let Command::Export {
+            project_name,
+            env,
+            format,
+            output_file,
+        } = cli.command.unwrap()
+        else {
+            panic!("expected export command");
+        };
+        assert_eq!(project_name.as_deref(), Some("frontierkings"));
+        assert_eq!(env, Some(Env::Prod));
+        assert_eq!(format, ExportFormat::DotenvEval);
+        assert_eq!(output_file, Some(PathBuf::from(".env")));
+    }
+
+    #[test]
+    fn export_defaults_to_dotenv_and_stdout() {
+        let cli = Cli::try_parse_from(["keyben", "export"]).unwrap();
+        let Command::Export {
+            format,
+            output_file,
+            ..
+        } = cli.command.unwrap()
+        else {
+            panic!("expected export command");
+        };
+        assert_eq!(format, ExportFormat::Dotenv);
+        assert_eq!(output_file, None);
+    }
+
     /// Every client-supplied value is optional, so a bare subcommand parses and the client is
     /// free to prompt for what is missing.
     #[test]
@@ -356,6 +438,7 @@ mod tests {
             vec!["keyben", "secrets", "get"],
             vec!["keyben", "secrets", "delete"],
             vec!["keyben", "password", "reset"],
+            vec!["keyben", "export"],
         ] {
             assert!(
                 Cli::try_parse_from(&argv).is_ok(),

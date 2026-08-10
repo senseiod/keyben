@@ -1,7 +1,7 @@
 //! keyben — an end-to-end encrypted environment variable manager (one binary for client and server).
 //!
 //! - `keyben -c <config.toml>`: run as the server for storage and Bearer Token authentication.
-//! - `keyben init | secrets | password | run`: run as the client for password-based encryption and decryption.
+//! - `keyben init | secrets | password | export | run`: run as the client for password-based encryption and decryption.
 //!
 //! The server never sees passwords or plaintext; the database holds only public envelope metadata
 //! (Argon2 salt, wrapped DEK, auth hash) and XChaCha20-Poly1305 ciphertext.
